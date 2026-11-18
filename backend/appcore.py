@@ -327,13 +327,13 @@ def _refresh_account_auth(email: str, auth: dict, force: bool = False) -> dict:
         return auth
 
 
-def _bootstrap_and_register(email: str, auth: dict) -> accounts.Account:
+def _bootstrap_and_register(email: str, auth: dict, *, auth_refresher=None) -> accounts.Account:
     """用 V2 Token 建立游戏会话并登记在线账号。"""
     client = GameClient(
         auth["access_token"],
         login_id=auth["user_id"],
         login_common=config.android_login_common(auth["device_id"]),
-        auth_refresher=lambda force=False: _refresh_account_auth(email, auth, force),
+        auth_refresher=auth_refresher or (lambda force=False: _refresh_account_auth(email, auth, force)),
     )
     try:
         client.bootstrap()

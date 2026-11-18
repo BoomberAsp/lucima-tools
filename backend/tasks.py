@@ -3668,8 +3668,8 @@ def task_redeem_codes(client: GameClient, params: dict | None = None,
         account_codes[code] = redeem_codes.normalize_record(record)
     if time.time() < ((runtime or {}).get("nextRetryAt") or 0):
         return {"ok": True, "skipped": True, "detail": "尚未到下次兑换检查时间"}
-    state = redeem_codes.get_state()
-    codes = state.get("codes") or []
+    single_code = (runtime or {}).get("single_code")
+    codes = [{"code": single_code}] if single_code else redeem_codes.get_state().get("codes") or []
     if not codes:
         return {"ok": True, "skipped": True, "detail": "当前没有可兑换码"}
     lines: list[str] = []
@@ -3758,7 +3758,8 @@ def task_redeem_codes(client: GameClient, params: dict | None = None,
         time.sleep(0.5)
     return {"ok": not retryable, "retryable": retryable, "skipped": not lines,
             "detail": "；".join(lines) if lines else "当前兑换码均已处理",
-            "lines": lines, "liveLogged": emit is not None}
+            "lines": lines, "liveLogged": emit is not None,
+            **({"codeStatus": account_codes.get(single_code, {}).get("status")} if single_code else {})}
 
 TASKS: dict[str, dict] = {
     "month_signin": {

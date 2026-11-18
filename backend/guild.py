@@ -507,7 +507,7 @@ class GuildService:
         self._cache(result, route)
         return result
 
-    def enter(self):
+    def enter(self, *, checkin: bool = True):
         """Refresh the entire joined-guild entry flow, then check in if needed."""
         if not has_guild(self.client.account_state):
             return {"skipped": True, "checkedIn": False}
@@ -535,7 +535,7 @@ class GuildService:
                 gid = object_id((guild.get("Info") or {}).get("_id"))
                 if gid and gid != guild_id(self.client.account_state):
                     raise GameError("佣兵团信息与登录快照不一致，请重新登录")
-        checked = self.checkin_if_due()
+        checked = self.checkin_if_due() if checkin else False
         state = self.client.account_state
         week = _nonnegative_int((state.get("PlayerGuildInfo") or {}).get("NowGuildQuestWeek"))
         public_week = _nonnegative_int(((state.get("GuildData") or {}).get("Record") or {}).get("LastResetQuestWeek"))

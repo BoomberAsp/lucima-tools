@@ -401,13 +401,13 @@ class Account:
                 delays.append(delay)
         return min(delays) if delays else None
 
-    def refresh_guild_locked(self, *, log_success=True):
+    def refresh_guild_locked(self, *, log_success=True, checkin=True):
         """Call under the account lock; manual refresh and login share all gates."""
         self.require_current_day()
         with self._request_scope(guild_entry=True):
-            return self._refresh_guild_locked(log_success=log_success)
+            return self._refresh_guild_locked(log_success=log_success, checkin=checkin)
 
-    def _refresh_guild_locked(self, *, log_success):
+    def _refresh_guild_locked(self, *, log_success, checkin=True):
         runtime = self.guild_runtime
         service = GuildService(self.client, runtime,
                                donation_reserves(self.params.get("guild_auto_donate")))
@@ -417,7 +417,8 @@ class Account:
             if not has_guild(self.client.account_state):
                 runtime["enteredRevision"] = self.state_revision
                 return
-            checked = service.enter().get("checkedIn", False)
+            entry = service.enter() if checkin else service.enter(checkin=False)
+            checked = entry.get("checkedIn", False)
             runtime["enteredRevision"] = self.state_revision
             runtime.pop("claimBlocked", None)
             runtime.pop("claimError", None)
@@ -1112,7 +1113,8 @@ class Account:
                 }, "自动·")
                 return False
 
-    def run_toggles(self, ids: list[str], prefix: str, log_to_buffer: bool = True) -> list[dict]:
+    def run_toggles(self, ids: list[str], prefix: str, log_to_buffer: bool = True,
+                    *, single_redeem_code: str | None = None) -> list[dict]:
         """在账号锁内执行一批 toggle 任务。log_to_buffer=True 时结果写日志缓冲（后台巡检用）；
         前台手动开关时设 False，由前端直接展示结果、避免与轮询重复。"""
         if not ids:
@@ -1145,15 +1147,21 @@ class Account:
             for task_id in ("send_meal", "month_signin"):
                 if task_id in ids:
                     self.task_runtime.setdefault(task_id, {}).update(claim_runtime[task_id])
+            params = self.params
+            task_runtime = self.task_runtime
             if "redeem_code" in ids:
-                self.params.setdefault("redeem_code", {})
+                if single_redeem_code is None:
+                    self.params.setdefault("redeem_code", {})
+                else:
+                    params = {**params, "redeem_code": {}}
+                    task_runtime = {**task_runtime, "redeem_code": {"single_code": single_redeem_code}}
             results = []
             for task_id in ids:
                 if self.automation_wait_reason(login_task=task_id in LOGIN_TASK_IDS):
                     break
                 with self._request_scope(login_task=task_id in LOGIN_TASK_IDS):
                     results.extend(run_toggle_tasks(
-                        self.client, [task_id], self.params, self.task_runtime, on_partial=on_partial))
+                        self.client, [task_id], params, task_runtime, on_partial=on_partial))
             for result in results:
                 task_id = result.get("id")
                 if result.get("deferred"):
@@ -1186,7 +1194,8 @@ class Account:
                 elif time.time() >= (runtime_state.get("nextRetryAt") or 0):
                     self._redeem_checked_revision = redeem_codes.revision()
                     self._redeem_pending = False
-                config.save_account(self.email, toggles=self.toggles, params=self.params)
+                if single_redeem_code is None:
+                    config.save_account(self.email, toggles=self.toggles, params=self.params)
         # 免费秘密商店的装备卡片需要沿用本轮货架，供"仅显示"模式下的手动购买使用。
         # 货架只保存在账号运行态，不塞进日志/HTTP 返回，避免把整份购买记录重复传给前端。
         for result in results:
