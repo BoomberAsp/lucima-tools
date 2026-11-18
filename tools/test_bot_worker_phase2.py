@@ -4,11 +4,20 @@ from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from backend.bot_worker import phase_two
+from backend.bot_worker import dispatch, phase_two
 from backend.tasks import task_dispatch
 
 
 class PhaseTwoTests(unittest.TestCase):
+    def test_restore_validates_the_account_from_portal(self):
+        saved = {"user_id": "test-owner", "refresh_token": "dummy-refresh"}
+        with patch("backend.portal.portal_refresh_v2", return_value={**saved, "access_token": "dummy-access"}) as refresh:
+            outcome = dispatch({"action": "resume", "auth": saved})
+            refresh.assert_called_once_with(saved)
+        self.assertEqual(outcome["status"], "ok")
+        with patch("backend.portal.portal_refresh_v2", return_value={**saved, "user_id": "another"}):
+            self.assertEqual(dispatch({"action": "resume", "auth": saved}), {"status": "login_failed"})
+
     def test_claim_dispatch_never_redispatches(self):
         state = {"ArkHighCommandData": {"DispatchedQuests": [{"StaticID": "A", "FinishTime": 1}]}}
         client = SimpleNamespace(account_state=state, _auth_data=lambda data: data,

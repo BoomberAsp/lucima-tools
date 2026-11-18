@@ -116,6 +116,15 @@ def dispatch(request: dict) -> dict:
         except PortalError:
             return {"status": "login_failed"}
         return {"status": "ok", "auth": auth}
+    if action == "resume":
+        saved = request["auth"]
+        try:
+            auth = portal_refresh_v2(saved)
+        except PortalError:
+            return {"status": "login_failed"}
+        if auth.get("user_id") != saved.get("user_id"):
+            return {"status": "login_failed"}
+        return {"status": "ok", "auth": auth}
 
     task = request.get("task")
     code = request.get("code", "")
