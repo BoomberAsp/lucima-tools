@@ -983,10 +983,11 @@ def task_tesseract(c: GameClient) -> dict:
 # ============派遣任务（ArkHighCommand）============
 # 固定 4 人小队 + 固定任务槽循环：任务到点(FinishTime<=now) → RewardQuest 领 → 用同一批
 # DispatchedHeroIDs 立即 DispatchQuest 续派。体力(StaticID=3)不足时只领不续派。
-def task_dispatch(c: GameClient) -> dict:
+def task_dispatch(c: GameClient, params: dict | None = None) -> dict:
     hc = (c.account_state or {}).get("ArkHighCommandData", {}) or {}
     quests = hc.get("DispatchedQuests") or []
     now_ms = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
+    claim_only = bool((params or {}).get("claimOnly"))
 
     if not quests:
         return {"ok": True, "skipped": True,
@@ -995,6 +996,7 @@ def task_dispatch(c: GameClient) -> dict:
     lines: list[str] = []
     counter: dict = {}
     redispatched = 0
+    claimed = 0
     reward_failed = False
     no_stamina = False
     latest_hc = None  # 最新一次响应带回的 ArkHighCommandData，循环后写回
@@ -1017,6 +1019,9 @@ def task_dispatch(c: GameClient) -> dict:
             reward_failed = True
             lines.append(f"{sid}：领取失败（{m.msg}）")
             continue
+        if claim_only and res.get("ArkHighCommandData") is None and res.get("Drop") is None:
+            reward_failed = True
+            continue
         if res.get("ArkHighCommandData") is not None:
             latest_hc = res["ArkHighCommandData"]
             c.account_state["ArkHighCommandData"] = latest_hc
@@ -1025,6 +1030,9 @@ def task_dispatch(c: GameClient) -> dict:
         for k, v in got.items():
             counter[k] = counter.get(k, 0) + v
         lines.append(f"{sid}：领取 {_fmt_items(got) if got else '完成'}")
+        claimed += 1
+        if claim_only:
+            continue
 
         # 2) 原队立即续派（复用同一批角色）。FinishTime 客户端只传占位，服务器重算。
         payload = c._auth_data({"Quest": {
@@ -1053,6 +1061,8 @@ def task_dispatch(c: GameClient) -> dict:
     if latest_hc is not None and c.account_state is not None:
         c.account_state["ArkHighCommandData"] = latest_hc
 
+    if claim_only:
+        return {"ok": not reward_failed, "skipped": not claimed and not reward_failed, "count": claimed}
     if not counter and redispatched == 0:
         if reward_failed:
             return {"ok": False, "retryable": True, "lines": lines,

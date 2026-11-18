@@ -327,10 +327,12 @@ class GuildService:
                            "count": min(remaining, available // rule["cost"])}
         return result
 
-    def donate_if_due(self, kind):
+    def donate_if_due(self, kind, *, max_count=None):
         rule = GUILD_DONATIONS[kind]
         before = self.donation_status()[kind]
         count = before["count"]
+        if max_count is not None:
+            count = min(count, max(0, max_count))
         if not count:
             return 0
         self._call(rule["route"], {"ItemID": rule["item"], "Count": count})
