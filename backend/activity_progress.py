@@ -142,7 +142,7 @@ def finish_once(client, info: dict, scene: dict) -> dict:
 
 @resources.pinned
 def run(client, family: str, team_id: str, support_entry=None, *, cancel_event, on_progress=None,
-        on_partial=None) -> dict:
+        on_partial=None, server_limits: tuple[int, int] | None = None) -> dict:
     from .tasks import _build_support
     from .abyss_battle import run_activity_battle
     state = client.account_state
@@ -157,9 +157,10 @@ def run(client, family: str, team_id: str, support_entry=None, *, cancel_event, 
     support = _build_support(support_entry) if support_entry else None
     # Validate all open stage references before spending resources on the first one.
     for stage in initial:
-        if not stage["cleared"]:
+        if server_limits is None and not stage["cleared"]:
             validate_scene(stage["id"])
     completed, lines, current = [], [], ""
+    energy_used = 0
     progress = {"family": family, "sceneId": "", "total": len(initial),
                 "completed": sum(stage["cleared"] for stage in initial)}
 
@@ -172,7 +173,7 @@ def run(client, family: str, team_id: str, support_entry=None, *, cancel_event, 
     def result(ok, detail):
         publish(detail=detail, battle=None)
         return {"ok": ok, "detail": detail, "lines": lines, "completedScenes": completed,
-                "lastSceneId": current}
+                "lastSceneId": current, "confirmedEnergy": energy_used}
 
     publish(detail="准备推关")
     while True:
@@ -185,14 +186,23 @@ def run(client, family: str, team_id: str, support_entry=None, *, cancel_event, 
         if not todo:
             return result(True, "当前已开放关卡全部通关")
         saved = records(state)
-        stage = next((s for s in todo if not s["preScene"] or cleared(saved.get(s["preScene"]))), None)
+        stage = next((s for s in todo if (server_limits is None or s["serverBattle"])
+                      and (not s["preScene"] or cleared(saved.get(s["preScene"])))), None)
         if stage is None:
-            return result(False, "剩余关卡的前置条件尚未满足")
+            return result(False, "没有满足前置条件的服务端战斗关卡" if server_limits is not None
+                          else "剩余关卡的前置条件尚未满足")
+        if server_limits is not None:
+            count_limit, energy_limit = server_limits
+            if len(completed) >= count_limit:
+                return result(True, "已达到本次关卡上限")
+            if stage["energy"] < 0 or energy_used + stage["energy"] > energy_limit:
+                return result(False, "下一关会超过体力预算，已停止")
         current = stage["id"]
         scene = validate_scene(current)
         items = {item.get("StaticID"): item for item in state.get("ItemContainer", {}).get("Items", [])}
         energy = items.get("3")  # CURRENCY_IDS.stamina
-        if energy is not None and int(energy.get("Count") or 0) < stage["energy"]:
+        if ((energy is not None and int(energy.get("Count") or 0) < stage["energy"])
+                or (server_limits is not None and energy is None and stage["energy"] > 0)):
             return result(False, "体力不足，自动推关已停止")
         if scene.get("EnterCost"):
             return result(False, "此关卡有额外入场消耗，暂不支持自动推关")
@@ -215,6 +225,7 @@ def run(client, family: str, team_id: str, support_entry=None, *, cancel_event, 
         if not outcome.get("ok") or not outcome.get("confirmed") or not cleared(records(state).get(current)):
             return result(False, f"{stage['name']}：{outcome.get('detail') or '结果未确认，等待登录同步刷新'}")
         completed.append(current)
+        energy_used += stage["energy"]
         stage_lines = outcome.get("lines") or ["通关成功（结算未返回掉落）"]
         if on_partial is not None:
             # 复用账号日志流，下一关开始前即可显示；最终响应不重复这些日志。

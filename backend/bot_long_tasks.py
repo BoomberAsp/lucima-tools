@@ -1,0 +1,192 @@
+"""Bounded QQ operations using the existing authenticated game client."""
+from __future__ import annotations
+
+import re
+
+from .game_client import GameError
+from .runtime_data import pinned
+
+
+LONG_TASKS = {"activity", "abyss", "buy_batch"}
+QUERIES = {"activity", "abyss", "shop"}
+
+
+def parse(task: str, code: str):
+    parts = code.split()
+    if task == "activity" and len(parts) == 4:
+        family, team, count, energy = parts
+        if (re.fullmatch(r"BH[0-9]{1,5}", family) and re.fullmatch(r"[A-Za-z0-9_-]{1,24}", team)
+                and re.fullmatch(r"[1-3]", count) and re.fullmatch(r"[0-9]{1,3}", energy)):
+            return family, team, int(count), int(energy)
+    if task == "abyss" and len(parts) == 3:
+        scene, *teams = parts
+        slots = [team.split(",") for team in teams]
+        if re.fullmatch(r"MysteriousRealm_[0-9]{1,2}", scene) and all(
+                1 <= len(team) <= 4 and any(role != "-" for role in team)
+                and all(re.fullmatch(r"[A-Za-z0-9_]{1,24}|-", role) for role in team) for team in slots):
+            return scene, {half: [None if role == "-" else role for role in team]
+                           for half, team in zip(("upper", "lower"), slots)}
+    if task == "buy_batch" and 1 <= len(parts) <= 5:
+        picks = []
+        for part in parts:
+            match = re.fullmatch(r"([A-Za-z0-9_]{1,32}):([1-9]|10):([0-9]{1,8}):([0-9]{1,8})", part)
+            if not match:
+                return None
+            sid, count, item, price = match.groups()
+            picks.append((sid, int(count), item, int(price)))
+        if len({pick[0] for pick in picks}) == len(picks):
+            return picks
+    return None
+
+
+def shop_rows(state):
+    from .tasks import store_shelves
+
+    return {row["id"]: row for store in store_shelves(state) for row in store["goods"]
+            if row["hasRecord"] and row["id"] != "VIPGIFT_VIPQuick4"}
+
+
+def query(state, kind):
+    from .activity_progress import cleared, records, scenes
+    from .tasks import abyss_scenes
+
+    if kind == "activity":
+        saved = records(state)
+        families = list(dict.fromkeys(row["family"] for row in scenes(state)
+                                      if row["serverBattle"] and not row["cleared"]
+                                      and (not row["preScene"] or cleared(saved.get(row["preScene"])))))
+        teams = [str(row["ID"]) for row in state.get("Teams", {}).get("Settings", [])
+                 if row.get("TeamSetting", {}).get("RolePosMap")]
+        return ["活动 ID " + ("、".join(families[:12]) or "暂无"), "队伍 ID " + ("、".join(teams[:12]) or "暂无")]
+    if kind == "abyss":
+        return [row["id"] for row in abyss_scenes(state)[:8]] or ["暂无可选关卡"]
+    return [f"{sid} {row['name']} · 货币 {row['cost']['item']} · 单价 {row['cost']['count']}"
+            for sid, row in shop_rows(state).items() if row["remain"] != 0][:8] or ["暂无可报价商品"]
+
+
+def buy(client, picks, cancel, progress):
+    from .tasks import _buy_payload, _collect_items, _item_count, _oid
+
+    details = []
+    totals = {}
+
+    def checked_quote(state, pick, shelves):
+        sid, count, item, price = pick
+        row = shelves.get(sid)
+        if not row or row["cost"]["item"] != item or row["cost"]["count"] != price:
+            return None
+        if row["remain"] is not None and row["remain"] < count:
+            return None
+        records = (state.get("StoreRecordContainer") or {}).get("Records") or []
+        record = next((rec for rec in records if rec.get("StaticID") == sid), None)
+        if record and _oid(record.get("_id")) and type(record.get("BuyCount")) is int:
+            return record
+        return None
+
+    state = client.account_state or {}
+    shelves = shop_rows(state)
+    for pick in picks:
+        if not checked_quote(state, pick, shelves):
+            return "skipped", [f"{pick[0]} 的报价、购买记录或额度不符，未提交购买"]
+        _, count, item, price = pick
+        totals[item] = totals.get(item, 0) + count * price
+    if any(_item_count(state, item) < total for item, total in totals.items()):
+        return "skipped", ["当前货币余额低于本批报价，未提交购买"]
+
+    for index, pick in enumerate(picks, 1):
+        if cancel.is_set():
+            return "cancelled", details
+        sid, count, item, price = pick
+        state = client.account_state or {}
+        record = checked_quote(state, pick, shop_rows(state))
+        if not record or _item_count(state, item) < count * price:
+            return ("partial" if details else "skipped"), [*details, f"{sid} 的报价、额度或余额已变化"]
+        progress(f"第 {index}/{len(picks)} 档 {sid}，已确认 {len(details)} 档")
+        if cancel.is_set():
+            return "cancelled", details
+        try:
+            response = client.call("StoreHandler.BuyCommodity", _buy_payload(client, record, count))
+            updated = response.get("CommodityRecord") or {}
+            spent = {}
+            _collect_items(response.get("CostItems"), spent)
+        except Exception:
+            return "unconfirmed", [*details, f"{sid} 的购买请求未获得可核对的结算"]
+        expected = {item: count * price} if price else {}
+        if spent != expected:
+            if spent:
+                return "unexpected_cost", [*details, f"{sid} 的返回扣款与确认报价不符"]
+            return "unconfirmed", [*details, f"{sid} 的扣款未确认"]
+        if (updated.get("StaticID") != sid or _oid(updated.get("_id")) != _oid(record.get("_id"))
+                or updated.get("BuyCount") != record["BuyCount"] + count):
+            return "unconfirmed", [*details, f"{sid} 的购买数量未确认"]
+        details.append(f"{sid} 已确认 {count} 份，消耗货币 {item} × {count * price}")
+        progress(f"已确认 {len(details)}/{len(picks)} 档")
+    return "ok", details
+
+
+def activity(client, args, cancel, progress):
+    from . import activity_progress
+
+    family, team, count, energy = args
+
+    def report(data):
+        scene = data.get("sceneId")
+        if scene:
+            progress(f"活动 {family} · {scene} · 已通关 {data['completed']}/{data['total']} 关")
+
+    try:
+        result = activity_progress.run(client, family, team, cancel_event=cancel, on_progress=report,
+                                       server_limits=(count, energy))
+    except GameError:
+        return "skipped", ["当前活动、队伍或前置条件不可用"]
+    completed = result["completedScenes"]
+    details = [f"确认通关 {len(completed)}/{count} 关，按关卡标价共 {result['confirmedEnergy']} 体力（预算 {energy}）",
+               *completed]
+    if getattr(client, "_activity_pending", None):
+        return "unconfirmed", [*details, f"{result['lastSceneId']} 的结算待核对"]
+    if cancel.is_set():
+        return "cancelled", details
+    if result["ok"]:
+        return ("ok" if completed else "skipped"), details
+    return ("partial" if completed else "skipped"), [*details, "推进已停止，请查看游戏内活动与前置关卡"]
+
+
+def abyss(client, args, cancel, progress):
+    from .abyss_battle import run_abyss_battle
+    from .abyss_state import enabled, metadata
+    from .tasks import normalize_abyss_config
+
+    scene, waves = args
+    definition = metadata()["tables"]["Scene"].get(scene) or {}
+    if (not enabled(definition.get("ServerBattle")) or definition.get("EnterCost")
+            or definition.get("Energy") not in (None, "", "0", 0)):
+        return "skipped", ["此关卡的服务端战斗或入场消耗不符合本次授权"]
+    try:
+        params = normalize_abyss_config(client.account_state, scene, waves)
+    except GameError:
+        return "skipped", ["关卡未解锁或上下半阵容当前不可用"]
+    if cancel.is_set():
+        return "cancelled", []
+    try:
+        result = run_abyss_battle(client, {**params, "_cancel_event": cancel,
+                                  "_on_progress": lambda data: progress(f"{scene} · 第 {data['wave'] + 1} 半场")})
+    except Exception:
+        return "unconfirmed", [f"{scene} 的结算待核对"]
+    outcome = str((result.get("raw") or {}).get("Result") or "").lower()
+    if outcome == "win" and result.get("ok"):
+        return "ok", [f"{scene} 服务端已返回胜利结算"]
+    if outcome in {"lose", "defeat", "draw"}:
+        return "skipped", [f"{scene} 服务端已结算，本次未通关"]
+    return "unconfirmed", [f"{scene} 的结算待核对"]
+
+
+@pinned
+def run(account, task, args, cancel, progress):
+    with account.lock, account._request_scope():
+        account.require_current_day()
+        if cancel.is_set():
+            return "cancelled", []
+        if task == "long_info":
+            return "ok", query(account.client.account_state or {}, args)
+        runner = {"activity": activity, "abyss": abyss, "buy_batch": buy}[task]
+        return runner(account.client, args, cancel, progress)

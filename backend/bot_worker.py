@@ -7,6 +7,8 @@ import os
 import re
 import signal
 import sys
+import threading
+import time
 
 
 TASKS = {
@@ -102,8 +104,9 @@ def exit_with_bridge(parent_pid: int) -> None:
         raise RuntimeError("Lucima bridge parent unavailable")
 
 
-def dispatch(request: dict) -> dict:
+def dispatch(request: dict, *, cancel=None, progress=None) -> dict:
     from . import accounts, appcore
+    from . import bot_long_tasks
     from .game_client import DuplicateLoginError, MaintenanceError, TaskDeferred, is_duplicate_login_message
     from .guild import has_guild
     from .maintenance import service as maintenance
@@ -128,12 +131,20 @@ def dispatch(request: dict) -> dict:
 
     task = request.get("task")
     code = request.get("code", "")
-    if (action != "run" or task not in (TASKS.keys() | PHASE_TWO) or not isinstance(code, str)
+    if not isinstance(task, str):
+        return {"status": "invalid"}
+    long_task = task in bot_long_tasks.LONG_TASKS or task == "long_info"
+    if (action != "run" or task not in (TASKS.keys() | PHASE_TWO | bot_long_tasks.LONG_TASKS | {"long_info"})
+            or not isinstance(code, str) or len(code) > 255
             or (task == "redeem" and not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", code))
             or (task == "donate" and code not in DONATION_CAPS)
             or (task == "stages" and code not in {"hunt", "elf"})
             or (task == "equipment" and len(code) > 24)):
         return {"status": "invalid"}
+    if long_task:
+        args = code if task == "long_info" and code in bot_long_tasks.QUERIES else bot_long_tasks.parse(task, code)
+        if args is None:
+            return {"status": "invalid"}
     auth = request["auth"]
     account_id = auth["user_id"]
 
@@ -147,8 +158,17 @@ def dispatch(request: dict) -> dict:
 
     try:
         with maintenance.operation_scope():
+            if cancel is not None and cancel.is_set():
+                return {"status": "cancelled"}
             refresh()
             account = appcore._bootstrap_and_register(account_id, auth, auth_refresher=refresh)
+            if long_task:
+                status, details = bot_long_tasks.run(account, task, args, cancel or threading.Event(),
+                                                      progress or (lambda message: None))
+                if (status in {"ok", "skipped", "cancelled"}
+                        and account.client.connection_status().get("reason") == "duplicate_login"):
+                    status = "duplicate_login"
+                return {"status": status, "auth": auth, "details": details}
             if task in PHASE_TWO:
                 status, details = phase_two(account, task, code)
                 if account.client.connection_status().get("reason") == "duplicate_login":
@@ -205,8 +225,19 @@ def main() -> None:
     try:
         if os.environ.get("ARK_DATA_DIR") and os.environ.get("ARK_PLATFORM") == "linux":
             exit_with_bridge(int(sys.argv[1]))
+            cancel = threading.Event()
+            signal.signal(signal.SIGTERM, lambda signum, frame: cancel.set())
             request = json.loads(sys.stdin.buffer.readline(16_385))
-            result = dispatch(request)
+            last = 0.0
+
+            def progress(message):
+                nonlocal last
+                now = time.monotonic()
+                if now - last >= 2:
+                    print(json.dumps({"progress": message[:160]}, ensure_ascii=True), flush=True)
+                    last = now
+
+            result = dispatch(request, cancel=cancel, progress=progress if request.get("stream") else None)
     except Exception:
         pass
     print(json.dumps(result, ensure_ascii=True), flush=True)

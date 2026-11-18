@@ -151,6 +151,22 @@ class ActivityProgressTests(unittest.TestCase):
         self.client.account_state["ActivityDBSettingContainer"]["SettingList"] = []
         self.assertEqual(ap.options(self.client.account_state), [])
 
+    def test_qq_limits_require_server_battle_prerequisites_and_budget(self):
+        result = ap.run(self.client, "BH610", "T", cancel_event=self.cancel, server_limits=(1, 24))
+        self.assertEqual(result["completedScenes"], [])
+        self.elite.assert_not_called()
+        self.client.call.assert_not_called()
+        self.clear(*range(1, 13))
+        result = ap.run(self.client, "BH610", "T", cancel_event=self.cancel, server_limits=(1, 23))
+        self.assertEqual(result["completedScenes"], [])
+        self.elite.assert_not_called()
+        result = ap.run(self.client, "BH610", "T", cancel_event=self.cancel, server_limits=(1, 24))
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["completedScenes"], ["BH610_1_13"])
+        self.assertEqual(result["confirmedEnergy"], 24)
+        self.elite.assert_called_once()
+        self.client.call.assert_not_called()
+
     def test_skip_cleared_and_resource_shortage_does_not_spend(self):
         self.clear(*range(1, 13))
         self.assertTrue(self.run_activity()["ok"])
