@@ -3,6 +3,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import httpx
+
 from backend import bot_long_tasks as long
 from backend.bot_worker import dispatch
 
@@ -91,6 +93,22 @@ class ShopRefreshTests(unittest.TestCase):
             result = dispatch(request)
         self.assertEqual(result["status"], "game_login_failed")
         self.assertNotIn("raw upstream data", str(result))
+
+    def test_game_login_reports_network_and_rejection_without_upstream_payload(self):
+        from backend.appcore import ApiError
+        from backend.game_client import GameMessage
+
+        request = {"action": "run", "task": "account_view", "code": "summary",
+                   "auth": {"user_id": "fixture", "access_token": "fixture"}}
+        for cause, status in ((httpx.ConnectTimeout("private data"), "game_login_unavailable"),
+                              (GameMessage("private data"), "game_login_rejected")):
+            with self.subTest(status=status):
+                error = ApiError(400, "private data")
+                error.__cause__ = cause
+                with patch("backend.portal.access_token_needs_refresh", return_value=False), patch(
+                    "backend.appcore._bootstrap_and_register", side_effect=error,
+                ):
+                    self.assertEqual(dispatch(request), {"status": status, "auth": request["auth"]})
 
     def test_secret_shop_uses_only_the_free_refresh(self):
         client = SimpleNamespace(account_state={}, _auth_data=lambda data: data, call=Mock(return_value={

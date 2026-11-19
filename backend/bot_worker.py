@@ -10,6 +10,8 @@ import sys
 import threading
 import time
 
+import httpx
+
 
 TASKS = {
     "signin": ("month_signin",),
@@ -112,7 +114,7 @@ def exit_with_bridge(parent_pid: int) -> None:
 def dispatch(request: dict, *, cancel=None, progress=None) -> dict:
     from . import accounts, appcore
     from . import bot_long_tasks, bot_views
-    from .game_client import DuplicateLoginError, MaintenanceError, TaskDeferred, is_duplicate_login_message
+    from .game_client import DuplicateLoginError, GameMessage, MaintenanceError, TaskDeferred, is_duplicate_login_message
     from .guild import has_guild
     from .maintenance import service as maintenance
     from .portal import PortalError, access_token_needs_refresh, portal_login_v2, portal_refresh_v2
@@ -264,6 +266,12 @@ def dispatch(request: dict, *, cancel=None, progress=None) -> dict:
         if isinstance(error, PortalError) or error.status == 401:
             return {"status": "auth_expired"}
         if not bootstrapped:
+            cause = error.__cause__
+            if (isinstance(cause, httpx.RequestError)
+                    or isinstance(cause, httpx.HTTPStatusError) and cause.response.is_server_error):
+                return {"status": "game_login_unavailable", "auth": auth}
+            if isinstance(cause, (GameMessage, httpx.HTTPStatusError)):
+                return {"status": "game_login_rejected", "auth": auth}
             return {"status": "game_login_failed", "auth": auth}
         return {"status": "unconfirmed", "auth": auth}
     except DuplicateLoginError:

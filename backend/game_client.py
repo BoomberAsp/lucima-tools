@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import gzip
 import json
+import re
 import threading
 import time
 import uuid
@@ -110,6 +111,17 @@ def is_duplicate_login_message(value: Any) -> bool:
     """Return whether a game response carries the duplicate-login marker."""
     normalized = " ".join(str(value or "").split()).casefold()
     return "duplicate login" in normalized
+
+
+def login_version(bulletin: Any, current: str) -> str:
+    """Keep an accepted profile version, or use an advertised full client version."""
+    info = bulletin.get("Info", bulletin) if isinstance(bulletin, dict) else None
+    versions = info.get("AvailableVersions") if isinstance(info, dict) else None
+    if not isinstance(versions, list) or current in versions:
+        return current
+    candidates = [value for value in versions if isinstance(value, str)
+                  and re.fullmatch(r"[0-9]+(?:\.[0-9]+){3}", value)]
+    return max(candidates, key=lambda value: tuple(map(int, value.split(".")))) if candidates else current
 
 
 _HEADERS = {
@@ -884,13 +896,16 @@ class GameClient:
 
     def _bootstrap_serial(self) -> dict:
         self._sync_login_auth(False)
-        common = {"Token": self.game_token, **self._login_common}
         uid_res = {}
 
-        # 1. 公告/服务器配置(可选，确认连通)
-        self.call("GameServerDBSettingHandler.QueryBulletinInfoResult", {})
+        # 公告既确认服务开放，也提供当前可用的游戏客户端版本。
+        bulletin = self.call("GameServerDBSettingHandler.QueryBulletinInfoResult", {})
         from .maintenance import service as maintenance_service
         maintenance_service.require_open()
+        version = login_version(bulletin, self._login_common.get("Version", config.GAME_VERSION))
+        if version != self._login_common.get("Version"):
+            log.info("[game] 登录客户端版本按官方公告切换：%s -> %s", self._login_common.get("Version"), version)
+        common = {"Token": self.game_token, **self._login_common, "Version": version}
 
         # V2 门户已经返回 userId，可直接作为 LoginID；旧 WebGL jwt 才需要 QueryUserID。
         if self._fixed_login_id:
@@ -911,7 +926,7 @@ class GameClient:
             # Token 可能被门户提前撤销，即使 JWT exp 尚未到期也强制续期并只重试一次。
             self._sync_login_auth(True)
             self.login_id = self._fixed_login_id
-            common = {"Token": self.game_token, **self._login_common}
+            common = {"Token": self.game_token, **self._login_common, "Version": version}
             state = self.call("AccountHandler.Login", {**common, "LoginID": self.login_id})
         self.session_id = state.get("SessionID")
         self.aid = state.get("Info", {}).get("_id", {}).get("$oid")

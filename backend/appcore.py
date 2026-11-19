@@ -344,7 +344,7 @@ def _bootstrap_and_register(email: str, auth: dict, *, auth_refresher=None) -> a
     except Exception as e:
         client.close()
         log.exception("游戏 bootstrap 失败: %s", e)
-        raise ApiError(400, f"游戏登录失败: {e}")
+        raise ApiError(400, f"游戏登录失败: {e}") from e
     return accounts.add(email, client, {"userId": auth["user_id"]})
 
 
