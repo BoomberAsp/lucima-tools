@@ -51,6 +51,7 @@ def view(account, args):
     if name == "equip_event":
         from .tasks import customized_equip_query
 
+        account.prepare_guild_for_qq_locked()
         result = customized_equip_query(client)
         if not result.get("ok"):
             return ["游戏暂未提供当前装备活动状态。"]
@@ -75,7 +76,7 @@ def view(account, args):
     if name in {"guild", "weekly", "guild_shop", "guild_aid", "guild_captain"}:
         if not has_guild(state):
             return ["当前账号未加入佣兵团。"]
-        account.refresh_guild_locked(log_success=False, checkin=False)
+        account.prepare_guild_for_qq_locked()
         guild = GuildService(client, account.guild_runtime)
         if name == "guild_aid":
             from .guild_aid import GuildAidService
@@ -158,12 +159,14 @@ def run_account_action(account, task, args):
     client = account.client
     state = client.account_state or {}
     if task == "tesseract":
+        account.prepare_guild_for_qq_locked()
         result = _claim_tesseract(client)
         return ("skipped" if result.get("skipped") else "ok" if result.get("ok") else "unconfirmed"), []
     if task == "sweep_illusion":
         progress = abyss_progress(state)
         if progress["sync"] > args:
             return "skipped", [f"持有 {progress['sync']} 个意识同步器，超过确认上限 {args}。"]
+        account.prepare_guild_for_qq_locked()
         result = task_abyss_sweep(client)
         if not result.get("ok"):
             return "unconfirmed", []
@@ -185,7 +188,7 @@ def run_account_action(account, task, args):
     quantity = int(count)
     if not has_guild(state):
         return "skipped", ["当前账号未加入佣兵团。"]
-    account.refresh_guild_locked(log_success=False, checkin=False)
+    account.prepare_guild_for_qq_locked()
     store = GuildStoreService(GuildService(client, account.guild_runtime))
     row = next((row for row in store.snapshot()["goods"] if row["id"] == identifier), None)
     if (not row or row["reset"] or row["currency"] != currency or row["price"] != int(unit)

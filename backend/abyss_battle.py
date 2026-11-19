@@ -18,7 +18,7 @@ from time import monotonic
 import httpx
 
 from . import config
-from .game_client import GameError
+from .game_client import GameError, TaskDeferred
 from .logutil import log
 from .tasks import _abyss_scene_records, _build_role_for_battle, _oid, _to_send_format
 from .abyss_state import (enabled, fantasy_config, initialize_units, metadata as _battle_metadata,
@@ -429,7 +429,12 @@ async def _run(c, scene_id: str, waves: dict, *, use_soul: bool = False, cancel_
     check_cancelled()
     if single_team:
         c._activity_pending = (state, scene_id)
-    room = c.call("RoomHandler.CreateRoomByScene", c._auth_data({"SceneID": scene_id}))
+    try:
+        room = c.call("RoomHandler.CreateRoomByScene", c._auth_data({"SceneID": scene_id}))
+    except TaskDeferred:
+        if single_team:
+            c._activity_pending = None
+        raise
     room_id = _room_value(room.get("_id"))
     server_id = room.get("ServerID")
     aid = _room_value(room.get("AID") or c.aid)

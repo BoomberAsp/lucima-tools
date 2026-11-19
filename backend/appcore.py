@@ -25,7 +25,7 @@ from . import redeem_codes
 from .guild import GuildService, describe_error
 from .guild_jobs import manager as guild_jobs
 from .logutil import log
-from .game_client import GameClient, GameError, GameMessage, is_duplicate_login_message
+from .game_client import GameClient, GameError, GameMessage, TaskDeferred, is_duplicate_login_message
 from .portal import (
     PortalError, access_token_expires_at, access_token_needs_refresh,
     portal_login_v2, portal_refresh_v2,
@@ -340,7 +340,7 @@ def _bootstrap_and_register(email: str, auth: dict, *, auth_refresher=None) -> a
     except PortalError as e:
         client.close()
         log.warning("账号 %s 登录凭证续期失败: %s", email, e)
-        raise ApiError(401, "登录凭证已过期，请重新输入密码登录")
+        raise ApiError(401, "登录凭证已过期，请重新输入密码登录") from e
     except Exception as e:
         client.close()
         log.exception("游戏 bootstrap 失败: %s", e)
@@ -830,6 +830,8 @@ def run(account: str, task_ids: list[str], params: dict) -> dict:
                         acc._before_game_request()
                     r = run_task(acc.client, tid, params.get(tid))
                 results.append({"id": tid, "name": name, **r})
+            except TaskDeferred as e:
+                results.append({"id": tid, "name": name, "ok": False, "deferred": True, "detail": str(e)})
             except Exception as e:
                 results.append({"id": tid, "name": name, "ok": False, "detail": str(e)})
     return {"results": results}

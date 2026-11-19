@@ -23,7 +23,7 @@ from . import config
 from .maintenance import service as maintenance_service
 from .logutil import log as _log
 from . import redeem_codes
-from .game_client import GameClient, GameError, GameMessage, TaskDeferred
+from .game_client import DuplicateLoginError, GameClient, GameError, GameMessage, MaintenanceError, TaskDeferred
 from .guild import (CAPTAIN_BUFF_STATUS_SYNC_MS, CaptainBuffStatusPending,
                     CaptainShopInsufficientCurrency, GuildService, has_guild,
                     describe_error, donation_options,
@@ -57,6 +57,10 @@ STATE_REFRESH_WINDOW_START = datetime_time(8, 5)
 STATE_REFRESH_WINDOW_SECONDS = 10 * 60
 DAY_MS = 86_400_000
 LOGIN_TASK_IDS = frozenset({"month_signin", "send_meal"})
+
+
+class GuildSyncDeferred(TaskDeferred):
+    """Guild synchronization prevented the requested operation from starting."""
 
 
 def _scheduler_time(value: float) -> str:
@@ -401,13 +405,28 @@ class Account:
                 delays.append(delay)
         return min(delays) if delays else None
 
-    def refresh_guild_locked(self, *, log_success=True, checkin=True):
+    def refresh_guild_locked(self, *, log_success=True, checkin=True, run_automation=True):
         """Call under the account lock; manual refresh and login share all gates."""
         self.require_current_day()
         with self._request_scope(guild_entry=True):
-            return self._refresh_guild_locked(log_success=log_success, checkin=checkin)
+            return self._refresh_guild_locked(log_success=log_success, checkin=checkin, run_automation=run_automation)
 
-    def _refresh_guild_locked(self, *, log_success, checkin=True):
+    def prepare_guild_for_qq_locked(self):
+        """Satisfy the current session's guild guard without running other tasks."""
+        maintenance_service.require_open()
+        self.require_current_day()
+        if not has_guild(self.client.account_state) or self.guild_runtime.get("enteredRevision") == self.state_revision:
+            return
+        try:
+            self.refresh_guild_locked(log_success=False, checkin=False, run_automation=False)
+        except (DuplicateLoginError, MaintenanceError):
+            raise
+        except Exception as error:
+            raise GuildSyncDeferred("佣兵团同步失败") from error
+        if self.guild_runtime.get("enteredRevision") != self.state_revision:
+            raise GuildSyncDeferred("佣兵团同步尚未完成")
+
+    def _refresh_guild_locked(self, *, log_success, checkin=True, run_automation=True):
         runtime = self.guild_runtime
         service = GuildService(self.client, runtime,
                                donation_reserves(self.params.get("guild_auto_donate")))
@@ -446,6 +465,8 @@ class Account:
         finally:
             runtime["loading"] = False
             self._guild_revision += 1
+        if not run_automation:
+            return
         self._claim_guild_locked()
         self._donate_guild_locked()
         self._aid_guild_locked()

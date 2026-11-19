@@ -6,7 +6,7 @@ import re
 import time
 import unicodedata
 
-from .game_client import GameError
+from .game_client import GameError, TaskDeferred
 from .runtime_data import pinned
 
 
@@ -126,7 +126,7 @@ def match_details(cards, position_key):
     return matches[:6]
 
 
-def refresh_shop(client, task, cancel, order=(1, "free"), scheme=None):
+def refresh_shop(client, task, cancel, order=(1, "free"), scheme=None, *, prepare=None):
     from .tasks import (
         _collect_items, _fmt_items, _record_goods_sid, item_name, secret_shop_next_free,
         shop_reset, star_source_query, star_source_refresh,
@@ -138,6 +138,10 @@ def refresh_shop(client, task, cancel, order=(1, "free"), scheme=None):
         next_free = secret_shop_next_free(client.account_state or {})
         if next_free is not None and next_free > time.time() * 1000:
             return "skipped", [f"申请 {count} 次，实际刷新 0 次。免费额度仍在冷却。"]
+        if prepare is not None:
+            prepare()
+        if cancel.is_set():
+            return "cancelled", []
         result = shop_reset(client, use_gold=False, auto_buy_sids=[], equipment_scheme=scheme)
         if not result.get("ok") and str(result.get("error", "")).replace(" ", "").casefold() == "cantreset":
             return "skipped", ["游戏返回免费刷新未就绪。"]
@@ -155,6 +159,8 @@ def refresh_shop(client, task, cancel, order=(1, "free"), scheme=None):
             return "ok", details
         return "unconfirmed", ["游戏未返回可确认的秘密商店新货架。"]
 
+    if prepare is not None:
+        prepare()
     initial = star_source_query(client)
     before = initial.get("refreshCount")
     if not initial.get("ok") or type(before) is not int or before < 0:
@@ -226,6 +232,8 @@ def buy(client, picks, cancel, progress):
             updated = response.get("CommodityRecord") or {}
             spent = {}
             _collect_items(response.get("CostItems"), spent)
+        except TaskDeferred:
+            return ("partial" if details else "not_started"), [*details, "账号状态需要同步，本档购买请求未提交。"]
         except Exception:
             return "unconfirmed", [*details, f"{sid} 的购买请求未获得可核对的结算"]
         expected = {item: count * price} if price else {}
@@ -249,13 +257,16 @@ def activity(client, args, cancel, progress):
     def report(data):
         scene = data.get("sceneId")
         if scene:
-            progress(f"活动 {family} · {scene} · 已通关 {data['completed']}/{data['total']} 关")
+            progress(f"活动 {family} · {scene} · 本轮确认 {data['confirmedCount']} 关"
+                     f" · 按标价 {data['confirmedEnergy']} 体力")
 
     try:
         result = activity_progress.run(client, family, team, cancel_event=cancel, on_progress=report,
                                        server_limits=(count, energy))
+    except TaskDeferred:
+        return "not_started", ["账号状态需要重新同步。"]
     except GameError:
-        return "skipped", ["当前活动、队伍或前置条件不可用"]
+        return "not_started", ["当前活动、队伍或前置条件不可用。"]
     completed = result["completedScenes"]
     details = [f"确认通关 {len(completed)}/{count} 关，按关卡标价共 {result['confirmedEnergy']} 体力（预算 {energy}）",
                *completed]
@@ -265,6 +276,13 @@ def activity(client, args, cancel, progress):
         return "cancelled", details
     if result["ok"]:
         return ("ok" if completed else "skipped"), details
+    reason = {
+        "scene_validation": "关卡配置未通过检查。",
+        "team_validation": "关卡或队伍配置未通过检查。",
+        "account_sync": "账号状态需要重新同步。",
+    }.get(result.get("stopReason"))
+    if reason:
+        return ("partial" if completed else "not_started"), [*details, reason]
     return ("partial" if completed else "skipped"), [*details, "推进已停止，请查看游戏内活动与前置关卡"]
 
 
@@ -287,6 +305,8 @@ def abyss(client, args, cancel, progress):
     try:
         result = run_abyss_battle(client, {**params, "_cancel_event": cancel,
                                   "_on_progress": lambda data: progress(f"{scene} · 第 {data['wave'] + 1} 半场")})
+    except TaskDeferred:
+        return "not_started", ["账号状态需要同步，挑战请求未提交。"]
     except Exception:
         return "unconfirmed", [f"{scene} 的结算待核对"]
     outcome = str((result.get("raw") or {}).get("Result") or "").lower()
@@ -307,6 +327,7 @@ def run(account, task, args, cancel, progress):
             return "ok", query(account.client.account_state or {}, args)
         if task in SHOP_TASKS:
             order, scheme = args
-            return refresh_shop(account.client, task, cancel, order, scheme)
+            return refresh_shop(account.client, task, cancel, order, scheme, prepare=account.prepare_guild_for_qq_locked)
+        account.prepare_guild_for_qq_locked()
         runner = {"activity": activity, "abyss": abyss, "buy_batch": buy}[task]
         return runner(account.client, args, cancel, progress)

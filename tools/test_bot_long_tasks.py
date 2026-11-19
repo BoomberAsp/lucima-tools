@@ -7,6 +7,7 @@ import httpx
 
 from backend import bot_long_tasks as long
 from backend.bot_worker import dispatch
+from backend.game_client import GameError, TaskDeferred
 
 
 class PurchaseTests(unittest.TestCase):
@@ -40,6 +41,19 @@ class PurchaseTests(unittest.TestCase):
         self.assertEqual((route, data["Count"], data["Record"]["_id"]),
                          ("StoreHandler.BuyCommodity", 1, "record1"))
 
+    def test_new_account_gate_does_not_report_unknown_purchase_settlement(self):
+        for steps, expected in (([TaskDeferred("day changed")], "not_started"),
+                                ([self.first, TaskDeferred("day changed")], "partial")):
+            with self.subTest(expected=expected):
+                self.client.call.reset_mock()
+                self.client.call.side_effect = steps
+                status, details = long.buy(self.client, self.picks, self.cancel, self.progress)
+                self.assertEqual(status, expected)
+                self.assertIn("未提交", details[-1])
+                self.assertEqual(len(steps), len(details))
+                if expected == "partial":
+                    self.assertIn("FriendShip3 已确认 1", details[0])
+
     def test_changed_debit_stops_the_batch(self):
         self.client.call.return_value = {**self.first, "CostItems": [{"Item": {"StaticID": "24", "Count": 101}}]}
         status, _ = long.buy(self.client, self.picks, self.cancel, self.progress)
@@ -72,8 +86,60 @@ class AbyssTests(unittest.TestCase):
         run.assert_called_once()
         self.assertEqual(set(run.call_args.args[1]), {"sceneId", "waves", "_cancel_event", "_on_progress"})
 
+    def test_guard_before_room_creation_does_not_report_unknown_battle(self):
+        args = long.parse("abyss", "MysteriousRealm_1 H001 H003")
+        with patch("backend.tasks.normalize_abyss_config", return_value={"waves": {}}), patch(
+            "backend.abyss_battle.run_abyss_battle", side_effect=TaskDeferred("day changed"),
+        ):
+            status, details = long.abyss(SimpleNamespace(account_state={}), args, threading.Event(), Mock())
+        self.assertEqual(status, "not_started")
+        self.assertIn("未提交", details[0])
+
+
+class ActivityTests(unittest.TestCase):
+    def test_second_stage_validation_failure_keeps_confirmed_stage_and_energy(self):
+        from backend import activity_progress
+
+        first, second = "BH999_1_1", "BH999_1_2"
+        available = [
+            {"id": first, "name": "first", "serverBattle": True, "energy": 5, "preScene": "", "cleared": False},
+            {"id": second, "name": "second", "serverBattle": True, "energy": 5, "preScene": first, "cleared": False},
+        ]
+        state = {"ItemContainer": {"Items": [{"StaticID": "3", "Count": 40}]},
+                 "SceneDataContainer": {"Scenes": []}}
+
+        def settle(client, start_info, **kwargs):
+            state["SceneDataContainer"]["Scenes"].append({"StaticID": first, "Stars": [1]})
+            available[0]["cleared"] = True
+            return {"ok": True, "confirmed": True}
+
+        progress = Mock()
+        with patch.object(activity_progress, "scenes", return_value=available), patch.object(
+            activity_progress, "validate_scene", return_value={},
+        ), patch.object(activity_progress, "start_info", side_effect=[{}, GameError("unavailable team")]), patch(
+            "backend.abyss_battle.run_activity_battle", side_effect=settle,
+        ) as battle, patch("backend.config.get_request_delay_config", return_value={"enabled": False}):
+            status, details = long.activity(SimpleNamespace(account_state=state), ("BH999", "0", 2, 10),
+                                            threading.Event(), progress)
+        self.assertEqual(status, "partial")
+        self.assertIn("共 5 体力", details[0])
+        self.assertEqual(details[1], first)
+        self.assertIn("队伍配置", details[-1])
+        self.assertTrue(any("本轮确认 1 关" in item.args[0] for item in progress.call_args_list))
+        battle.assert_called_once()
+
 
 class ShopRefreshTests(unittest.TestCase):
+    def test_secret_shop_cooldown_needs_no_live_guild_preflight(self):
+        client = SimpleNamespace(account_state={}, call=Mock())
+        prepare = Mock()
+        with patch("backend.tasks.secret_shop_next_free", return_value=10**15):
+            status, details = long.refresh_shop(client, "refresh_secret", threading.Event(), prepare=prepare)
+        self.assertEqual(status, "skipped")
+        self.assertIn("冷却", details[0])
+        prepare.assert_not_called()
+        client.call.assert_not_called()
+
     def test_reference_quotes_need_no_game_session(self):
         with patch("backend.appcore._bootstrap_and_register") as login:
             result = dispatch({"action": "run", "task": "long_info", "code": "shop"})

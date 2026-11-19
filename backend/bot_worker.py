@@ -69,8 +69,7 @@ def phase_two(account, task: str, arg: str) -> tuple[str, list[str]]:
                 return "deferred", ["游戏快照未明确返回免费次数，已停止"]
             if used:
                 return "skipped", ["本日免费次数已使用"]
-            if has_guild(state):
-                account.refresh_guild_locked(log_success=False, checkin=False)
+            account.prepare_guild_for_qq_locked()
             result = task_free_summon(client)
             response = result.get("raw")
             if isinstance(response, dict) and response.get("CostItems"):
@@ -81,9 +80,10 @@ def phase_two(account, task: str, arg: str) -> tuple[str, list[str]]:
             return "unconfirmed", []
         if not has_guild(state):
             return "skipped", ["当前账号未加入佣兵团"]
-        account.refresh_guild_locked(log_success=False, checkin=task == "guild")
+        account.prepare_guild_for_qq_locked()
         guild = GuildService(client, account.guild_runtime)
         if task == "guild":
+            guild.checkin_if_due()
             return ("ok", ["今日佣兵团签到已确认"]) if guild.snapshot()["checkedIn"] else ("unconfirmed", [])
         if task == "guild_weekly":
             weekly = GuildWeeklyService(guild)
@@ -115,9 +115,10 @@ def dispatch(request: dict, *, cancel=None, progress=None) -> dict:
     from . import accounts, appcore
     from . import bot_long_tasks, bot_views
     from .game_client import DuplicateLoginError, GameMessage, MaintenanceError, TaskDeferred, is_duplicate_login_message
-    from .guild import has_guild
     from .maintenance import service as maintenance
-    from .portal import PortalError, access_token_needs_refresh, portal_login_v2, portal_refresh_v2
+    from .portal import (
+        PortalAuthorizationRejected, PortalError, access_token_needs_refresh, portal_login_v2, portal_refresh_v2,
+    )
 
     action = request.get("action")
     if action == "login":
@@ -130,8 +131,10 @@ def dispatch(request: dict, *, cancel=None, progress=None) -> dict:
         saved = request["auth"]
         try:
             auth = portal_refresh_v2(saved)
+        except PortalAuthorizationRejected:
+            return {"status": "auth_expired"}
         except PortalError:
-            return {"status": "login_failed"}
+            return {"status": "auth_unavailable"}
         if auth.get("user_id") != saved.get("user_id"):
             return {"status": "login_failed"}
         return {"status": "ok", "auth": auth}
@@ -203,18 +206,16 @@ def dispatch(request: dict, *, cancel=None, progress=None) -> dict:
             refresh()
             account = appcore._bootstrap_and_register(account_id, auth, auth_refresher=refresh)
             bootstrapped = True
+            account.require_current_day()
             if task in account_actions:
                 with account.lock, account._request_scope():
-                    account.require_current_day()
                     status, details = bot_views.run_account_action(account, task, args)
                 return {"status": status, "auth": auth, "details": details}
             if task == "account_view":
                 with account.lock, account._request_scope():
-                    account.require_current_day()
                     return {"status": "ok", "auth": auth, "details": bot_views.view(account, args)}
             if task == "filter_preview":
                 with account.lock, account._request_scope():
-                    account.require_current_day()
                     details = bot_views.filter_preview(account.client.account_state or {}, args)
                 return {"status": "ok", "auth": auth, "details": details}
             if task in extended_tasks:
@@ -229,16 +230,13 @@ def dispatch(request: dict, *, cancel=None, progress=None) -> dict:
                 if account.client.connection_status().get("reason") == "duplicate_login":
                     status = "duplicate_login"
                 return {"status": status, "auth": auth, "details": details}
+            toggles = TASKS[task]
+            if task != "mail" and any(toggle not in accounts.LOGIN_TASK_IDS for toggle in toggles):
+                with account.lock:
+                    account.prepare_guild_for_qq_locked()
             if task in {"mail", "dispatch"}:
-                if task == "dispatch" and has_guild(account.client.account_state):
-                    with account.lock:
-                        account.refresh_guild_locked(log_success=False, checkin=False)
                 results = appcore.run(account_id, list(TASKS[task]), {"dispatch": {"claimOnly": True}})["results"]
             else:
-                toggles = TASKS[task]
-                if task in {"base", "redeem", "achievement"} and has_guild(account.client.account_state):
-                    with account.lock:
-                        account.refresh_guild_locked(log_success=False, checkin=False)
                 account.toggles.update(dict.fromkeys(toggles, True))
                 results = account.run_toggles(
                     list(toggles), "QQ·", log_to_buffer=False,
@@ -247,6 +245,8 @@ def dispatch(request: dict, *, cancel=None, progress=None) -> dict:
         connection_reason = account.client.connection_status().get("reason")
         if connection_reason == "duplicate_login":
             return {"status": "duplicate_login", "auth": auth}
+        if not results or all(item.get("deferred") for item in results):
+            return {"status": "not_started", "auth": auth, "details": ["账号状态暂不满足任务的执行条件。"]}
         if (connection_reason == "maintenance" or len(results) != len(TASKS[task])
                 or any(item.get("deferred") for item in results)):
             return {"status": "deferred", "auth": auth}
@@ -259,14 +259,17 @@ def dispatch(request: dict, *, cancel=None, progress=None) -> dict:
         details = [f"已领取 {results[0]['count']} 项派遣奖励"] if task == "dispatch" and results[0].get("count") else []
         return {"status": status, "auth": auth, "details": details}
     except (PortalError, appcore.ApiError) as error:
+        cause = error.__cause__
+        portal_error = error if isinstance(error, PortalError) else cause
+        if isinstance(portal_error, PortalAuthorizationRejected):
+            return {"status": "auth_expired"}
+        if isinstance(portal_error, PortalError):
+            return {"status": "auth_unavailable", "auth": auth}
         if is_duplicate_login_message(str(error)):
             return {"status": "duplicate_login", "auth": auth}
         if isinstance(error.__context__, MaintenanceError):
             return {"status": "deferred", "auth": auth}
-        if isinstance(error, PortalError) or error.status == 401:
-            return {"status": "auth_expired"}
         if not bootstrapped:
-            cause = error.__cause__
             if (isinstance(cause, httpx.RequestError)
                     or isinstance(cause, httpx.HTTPStatusError) and cause.response.is_server_error):
                 return {"status": "game_login_unavailable", "auth": auth}
@@ -276,7 +279,11 @@ def dispatch(request: dict, *, cancel=None, progress=None) -> dict:
         return {"status": "unconfirmed", "auth": auth}
     except DuplicateLoginError:
         return {"status": "duplicate_login", "auth": auth}
-    except (MaintenanceError, TaskDeferred):
+    except accounts.GuildSyncDeferred:
+        return {"status": "not_started", "auth": auth, "details": ["佣兵团同步失败。"]}
+    except TaskDeferred:
+        return {"status": "not_started", "auth": auth, "details": ["账号状态需要重新同步。"]}
+    except MaintenanceError:
         return {"status": "deferred", "auth": auth}
     finally:
         accounts.remove(account_id)

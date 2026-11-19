@@ -11,7 +11,7 @@ import uuid
 
 from . import config
 from .abyss_state import metadata
-from .game_client import GameError, GameMessage
+from .game_client import GameError, GameMessage, TaskDeferred
 from .game_data import activity_open, enabled
 
 
@@ -132,6 +132,9 @@ def finish_once(client, info: dict, scene: dict) -> dict:
             "IsQuickBattle": 0}))
     except GameMessage as error:
         return {"ok": False, "confirmed": True, "detail": _scene_failure_detail(error.msg)}
+    except TaskDeferred:
+        client._activity_pending = None
+        raise
     client.apply_scene_reward(reward)
     _cache_urgent_missions(client, reward)
     returned = reward.get("SceneData") or {}
@@ -167,13 +170,16 @@ def run(client, family: str, team_id: str, support_entry=None, *, cancel_event, 
     def publish(**extra):
         live = scenes(state, family)
         progress.update(sceneId=current, total=len(live), completed=sum(s["cleared"] for s in live), **extra)
+        if server_limits is not None:
+            progress.update(confirmedCount=len(completed), confirmedEnergy=energy_used)
         if on_progress:
             on_progress(deepcopy(progress))
 
-    def result(ok, detail):
+    def result(ok, detail, *, stop_reason=None):
         publish(detail=detail, battle=None)
         return {"ok": ok, "detail": detail, "lines": lines, "completedScenes": completed,
-                "lastSceneId": current, "confirmedEnergy": energy_used}
+                "lastSceneId": current, "confirmedEnergy": energy_used,
+                **({"stopReason": stop_reason} if stop_reason else {})}
 
     publish(detail="准备推关")
     while True:
@@ -198,7 +204,12 @@ def run(client, family: str, team_id: str, support_entry=None, *, cancel_event, 
             if stage["energy"] < 0 or energy_used + stage["energy"] > energy_limit:
                 return result(False, "下一关会超过体力预算，已停止")
         current = stage["id"]
-        scene = validate_scene(current)
+        try:
+            scene = validate_scene(current)
+        except (GameError, AttributeError, KeyError, TypeError, ValueError):
+            if server_limits is None:
+                raise
+            return result(False, "关卡配置未通过检查", stop_reason="scene_validation")
         items = {item.get("StaticID"): item for item in state.get("ItemContainer", {}).get("Items", [])}
         energy = items.get("3")  # CURRENCY_IDS.stamina
         if ((energy is not None and int(energy.get("Count") or 0) < stage["energy"])
@@ -206,7 +217,12 @@ def run(client, family: str, team_id: str, support_entry=None, *, cancel_event, 
             return result(False, "体力不足，自动推关已停止")
         if scene.get("EnterCost"):
             return result(False, "此关卡有额外入场消耗，暂不支持自动推关")
-        info = start_info(state, current, team_id, support)
+        try:
+            info = start_info(state, current, team_id, support)
+        except (GameError, AttributeError, KeyError, TypeError, ValueError):
+            if server_limits is None:
+                raise
+            return result(False, "关卡或队伍配置未通过检查", stop_reason="team_validation")
         publish(stageName=stage["name"], detail="挑战中", battle=None)
         if cancel_event.is_set():
             return result(False, "自动推关已停止")
@@ -218,6 +234,8 @@ def run(client, family: str, team_id: str, support_entry=None, *, cancel_event, 
                 outcome = finish_once(client, info, scene)
         except Exception as error:
             pending = getattr(client, "_activity_pending", None)
+            if server_limits is not None and isinstance(error, TaskDeferred) and not pending:
+                return result(False, "账号状态需要重新同步", stop_reason="account_sync")
             suffix = "；结果未确认，等待登录同步刷新" if pending and pending[0] is state else ""
             return result(False, f"{stage['name']}：{error}{suffix}")
         if outcome.get("confirmed"):

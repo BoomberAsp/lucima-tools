@@ -19,6 +19,10 @@ class PortalError(Exception):
     pass
 
 
+class PortalAuthorizationRejected(PortalError):
+    """The renewal endpoint explicitly rejected the credential."""
+
+
 _RETRY_STATUS = {502, 503, 504}
 
 
@@ -37,13 +41,15 @@ def _headers(device_id: str) -> dict[str, str]:
     }
 
 
-def _response_json(response: httpx.Response, stage: str) -> dict:
+def _response_json(response: httpx.Response, stage: str, *, renewal: bool = False) -> dict:
     try:
         body = response.json()
     except Exception as error:
         raise PortalError(f"{stage}返回非 JSON（HTTP {response.status_code}）") from error
     if not isinstance(body, dict):
         raise PortalError(f"{stage}响应格式无效")
+    if renewal and response.status_code == 401:
+        raise PortalAuthorizationRejected("门户拒绝续期凭证")
     if response.is_error:
         message = body.get("message") or body.get("msg") or f"HTTP {response.status_code}"
         raise PortalError(f"{stage}失败：{message}")
@@ -74,11 +80,13 @@ def _post_json(
                 continue
             log.info("[portal<-] %s HTTP %s response body suppressed (login), %d bytes",
                      stage, response.status_code, len(getattr(response, "content", b"")))
-            return _response_json(response, stage)
+            return _response_json(response, stage, renewal=url == config.PORTAL_V2_REFRESH)
         except (httpx.ConnectError, httpx.TimeoutException) as error:
             last_error = error
             if attempt + 1 < attempts:
                 continue
+        except httpx.RequestError as error:
+            raise PortalError(f"{stage}网络请求失败") from error
     raise PortalError(f"{stage}网络请求失败：{last_error}") from last_error
 
 
@@ -178,12 +186,16 @@ def portal_refresh_v2(auth: dict) -> dict:
             retry=False,
         )
 
-    data = result.get("data") or {}
-    access_token = str(data.get("accessToken") or "")
-    new_refresh_token = str(data.get("refreshToken") or refresh_token)
-    if not access_token:
+    data = result.get("data")
+    if not isinstance(data, dict):
+        data = {}
+    access_token = data.get("accessToken")
+    new_refresh_token = data.get("refreshToken") or refresh_token
+    if not isinstance(access_token, str) or not access_token:
         message = result.get("message") or result.get("msg")
         raise PortalError(str(message or "登录令牌续期响应缺少 accessToken"))
+    if not isinstance(new_refresh_token, str):
+        raise PortalError("登录令牌续期响应格式无效")
     return {
         **auth,
         "kind": "erolabs-v2",
