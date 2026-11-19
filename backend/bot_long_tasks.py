@@ -1,8 +1,10 @@
 """Bounded QQ operations using the existing authenticated game client."""
 from __future__ import annotations
 
+import json
 import re
 import time
+import unicodedata
 
 from .game_client import GameError
 from .runtime_data import pinned
@@ -11,6 +13,37 @@ from .runtime_data import pinned
 LONG_TASKS = {"activity", "abyss", "buy_batch"}
 SHOP_TASKS = {"refresh_secret", "refresh_star_source"}
 QUERIES = {"activity", "abyss"}
+MAX_SHOP_ROUNDS = 20
+
+
+def parse_shop(task: str, code: str):
+    words = unicodedata.normalize("NFKC", code).split()
+    if not words:
+        return 1, "free" if task == "refresh_secret" else "star"
+    if not re.fullmatch(r"[1-9][0-9]?", words[0]) or int(words[0]) > MAX_SHOP_ROUNDS:
+        return None
+    count = int(words[0])
+    if task == "refresh_star_source" and len(words) == 1:
+        return count, "star"
+    if task == "refresh_secret" and (len(words) == 1 or len(words) == 2 and words[1] in {"free", "diamond"}):
+        return count, words[1] if len(words) == 2 else ("free" if count == 1 else "choose")
+    return None
+
+
+def parse_shop_request(task: str, code: str):
+    scheme = None
+    if code.startswith("{"):
+        try:
+            body = json.loads(code)
+        except (ValueError, RecursionError):
+            return None
+        if not isinstance(body, dict) or set(body) != {"order", "scheme"}:
+            return None
+        code, scheme = body["order"], body["scheme"]
+        if not isinstance(code, str) or not isinstance(scheme, dict) or not isinstance(scheme.get("slots"), dict):
+            return None
+    order = parse_shop(task, code)
+    return (order, scheme) if order else None
 
 
 def parse(task: str, code: str):
@@ -75,20 +108,25 @@ def query(state, kind):
     return [row["id"] for row in abyss_scenes(state)[:8]] or ["暂无可选关卡"]
 
 
-def refresh_shop(client, task, cancel):
+def refresh_shop(client, task, cancel, order=(1, "free"), scheme=None):
     from .tasks import (
         _collect_items, _fmt_items, _record_goods_sid, item_name, secret_shop_next_free,
         shop_reset, star_source_query, star_source_refresh,
     )
+    count, mode = order
     if task == "refresh_secret":
+        if mode != "free":
+            return "quote_unavailable", ["当前游戏数据未提供可核实的钻石刷新报价。"]
         next_free = secret_shop_next_free(client.account_state or {})
         if next_free is not None and next_free > time.time() * 1000:
-            return "skipped", ["秘密商店的免费刷新仍在冷却。"]
-        result = shop_reset(client, use_gold=False, auto_buy_sids=[])
+            return "skipped", [f"申请 {count} 次，实际刷新 0 次。免费额度仍在冷却。"]
+        result = shop_reset(client, use_gold=False, auto_buy_sids=[], equipment_scheme=scheme)
         if not result.get("ok") and str(result.get("error", "")).replace(" ", "").casefold() == "cantreset":
             return "skipped", ["游戏返回免费刷新未就绪。"]
         records = result.get("records") or []
-        details = [f"新货架共 {len(records)} 档，自动购买 0 件。"]
+        details = [f"申请 {count} 次，实际刷新 1 次。新货架 {len(records)} 档。", "自动购买 0 件。"]
+        if scheme:
+            details.append(f"过滤方案命中 {len(result.get('legendaryMatches') or [])} 件装备。")
         for index, record in enumerate(records[:6], 1):
             sid = _record_goods_sid(record)
             details.append(f"第 {index} 档 · {item_name(str(sid)) if sid else '装备'}")
@@ -102,14 +140,18 @@ def refresh_shop(client, task, cancel):
     before = initial.get("refreshCount")
     if not initial.get("ok") or type(before) is not int or before < 0:
         return "skipped", ["星源商店的刷新状态不可用，未提交刷新。"]
+    if count > 1:
+        return "quote_unavailable", [f"申请 {count} 次。游戏状态接口未提供可核实的批量刷新报价。"]
     if cancel.is_set():
         return "cancelled", []
-    result = star_source_refresh(client, {})
+    result = star_source_refresh(client, scheme or {})
     after = result.get("refreshCount")
     if not result.get("ok") or type(after) is not int or after == before:
         return "unconfirmed", ["游戏未返回可确认的星源商店新刷新计数。"]
     cards = result.get("cards") or []
     details = [f"刷新计数 {before} → {after}，返回 {len(cards)} 件装备，自动购买 0 件。"]
+    if scheme:
+        details.append(f"过滤方案命中 {len(result.get('matches') or [])} 件装备。")
     spent = {}
     _collect_items(result.get("costItems"), spent)
     if spent:
@@ -244,6 +286,7 @@ def run(account, task, args, cancel, progress):
         if task == "long_info":
             return "ok", query(account.client.account_state or {}, args)
         if task in SHOP_TASKS:
-            return refresh_shop(account.client, task, cancel)
+            order, scheme = args
+            return refresh_shop(account.client, task, cancel, order, scheme)
         runner = {"activity": activity, "abyss": abyss, "buy_batch": buy}[task]
         return runner(account.client, args, cancel, progress)

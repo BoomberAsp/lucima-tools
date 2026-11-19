@@ -18,6 +18,11 @@ TASKS = {
     "redeem": ("redeem_code",),
     "dispatch": ("dispatch",),
     "achievement": ("daily_achievement",),
+    "friend_support": ("friend_support",),
+    "send_meal": ("send_meal",),
+    "reactor": ("reactor",),
+    "potion": ("sf_potion",),
+    "starforce": ("sf_starforce",),
 }
 PHASE_TWO = {"guild", "guild_weekly", "donate", "recruit", "stages", "equipment"}
 DONATION_CAPS = {"gold": 5000, "courage": 1}
@@ -106,7 +111,7 @@ def exit_with_bridge(parent_pid: int) -> None:
 
 def dispatch(request: dict, *, cancel=None, progress=None) -> dict:
     from . import accounts, appcore
-    from . import bot_long_tasks
+    from . import bot_long_tasks, bot_views
     from .game_client import DuplicateLoginError, MaintenanceError, TaskDeferred, is_duplicate_login_message
     from .guild import has_guild
     from .maintenance import service as maintenance
@@ -133,19 +138,47 @@ def dispatch(request: dict, *, cancel=None, progress=None) -> dict:
     code = request.get("code", "")
     if not isinstance(task, str):
         return {"status": "invalid"}
-    extended_tasks = bot_long_tasks.LONG_TASKS | bot_long_tasks.SHOP_TASKS | {"long_info"}
+    account_actions = {"tesseract", "sweep_illusion", "member_purchase"}
+    extended_tasks = (bot_long_tasks.LONG_TASKS | bot_long_tasks.SHOP_TASKS | account_actions
+                      | {"long_info", "account_view", "filter_preview"})
     if (action != "run" or task not in (TASKS.keys() | PHASE_TWO | extended_tasks)
-            or not isinstance(code, str) or len(code) > 255
+            or not isinstance(code, str) or len(code) > (2300 if task in bot_long_tasks.SHOP_TASKS | {"filter_preview"} else 255)
             or (task == "redeem" and not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", code))
             or (task == "donate" and code not in DONATION_CAPS)
             or (task == "stages" and code not in {"hunt", "elf"})
             or (task == "equipment" and len(code) > 24)
-            or (task in bot_long_tasks.SHOP_TASKS and code)):
+            or (task in TASKS.keys() - {"redeem"} and code)):
         return {"status": "invalid"}
     if task == "long_info" and code == "shop":
         return {"status": "ok", "details": bot_long_tasks.shop_reference()}
     args = None
-    if task in bot_long_tasks.LONG_TASKS or task == "long_info":
+    if task == "tesseract" and code:
+        return {"status": "invalid"}
+    if task == "member_purchase":
+        match = bot_views.GUILD_ORDER.fullmatch(code)
+        if not match:
+            return {"status": "invalid"}
+        args = match.groups()
+    elif task == "sweep_illusion":
+        if not re.fullmatch(r"[1-9][0-9]{0,2}", code):
+            return {"status": "invalid"}
+        args = int(code)
+    elif task == "filter_preview":
+        try:
+            args = json.loads(code)
+        except (ValueError, RecursionError):
+            return {"status": "invalid"}
+        if not isinstance(args, dict) or not isinstance(args.get("slots"), dict):
+            return {"status": "invalid"}
+    elif task == "account_view":
+        args = bot_views.parse_view(code)
+        if args is None:
+            return {"status": "invalid"}
+    elif task in bot_long_tasks.SHOP_TASKS:
+        args = bot_long_tasks.parse_shop_request(task, code)
+        if args is None:
+            return {"status": "invalid"}
+    elif task in bot_long_tasks.LONG_TASKS or task == "long_info":
         args = code if task == "long_info" and code in bot_long_tasks.QUERIES else bot_long_tasks.parse(task, code)
         if args is None:
             return {"status": "invalid"}
@@ -168,6 +201,20 @@ def dispatch(request: dict, *, cancel=None, progress=None) -> dict:
             refresh()
             account = appcore._bootstrap_and_register(account_id, auth, auth_refresher=refresh)
             bootstrapped = True
+            if task in account_actions:
+                with account.lock, account._request_scope():
+                    account.require_current_day()
+                    status, details = bot_views.run_account_action(account, task, args)
+                return {"status": status, "auth": auth, "details": details}
+            if task == "account_view":
+                with account.lock, account._request_scope():
+                    account.require_current_day()
+                    return {"status": "ok", "auth": auth, "details": bot_views.view(account, args)}
+            if task == "filter_preview":
+                with account.lock, account._request_scope():
+                    account.require_current_day()
+                    details = bot_views.filter_preview(account.client.account_state or {}, args)
+                return {"status": "ok", "auth": auth, "details": details}
             if task in extended_tasks:
                 status, details = bot_long_tasks.run(account, task, args, cancel or threading.Event(),
                                                       progress or (lambda message: None))

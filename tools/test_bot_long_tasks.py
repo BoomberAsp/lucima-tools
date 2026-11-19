@@ -99,7 +99,28 @@ class ShopRefreshTests(unittest.TestCase):
         status, details = long.refresh_shop(client, "refresh_secret", threading.Event())
         self.assertEqual(status, "ok")
         client.call.assert_called_once_with("StoreHandler.ResetRandomStore", {"StoreID": "SecretShop", "IsUseGold": 0})
-        self.assertIn("自动购买 0 件", details[0])
+        self.assertIn("自动购买 0 件", details[1])
+
+    def test_free_count_is_bounded_and_paid_refreshes_need_quotes(self):
+        self.assertEqual(long.parse_shop("refresh_secret", "５ free"), (5, "free"))
+        self.assertIsNone(long.parse_shop("refresh_star_source", "1.5"))
+        self.assertIsNone(long.parse_shop("refresh_star_source", "21"))
+        client = SimpleNamespace(account_state={}, _auth_data=lambda data: data, call=Mock(return_value={
+            "Records": [{"Store": "SecretShop", "StaticID": "fixture"}],
+        }))
+        status, details = long.refresh_shop(client, "refresh_secret", threading.Event(), (5, "free"))
+        self.assertEqual(status, "ok")
+        self.assertIn("申请 5 次，实际刷新 1 次", details[0])
+        client.call.assert_called_once()
+        client.call.reset_mock(return_value=True)
+        self.assertEqual(long.refresh_shop(client, "refresh_secret", threading.Event(), (5, "diamond"))[0],
+                         "quote_unavailable")
+        client.call.assert_not_called()
+        client.call.return_value = {"Data": {"RefreshCount": 2}}
+        self.assertEqual(long.refresh_shop(client, "refresh_star_source", threading.Event(), (5, "star"))[0],
+                         "quote_unavailable")
+        self.assertEqual(client.call.call_args.args[0], "CustomEquipHandler.Query")
+        client.call.assert_called_once()
 
     def test_star_source_reads_state_then_refreshes_once(self):
         client = SimpleNamespace(_auth_data=lambda data: data, call=Mock(side_effect=[
@@ -114,3 +135,12 @@ class ShopRefreshTests(unittest.TestCase):
         client = SimpleNamespace(_auth_data=lambda data: data, call=Mock(return_value={"Data": {}}))
         self.assertEqual(long.refresh_shop(client, "refresh_star_source", threading.Event())[0], "skipped")
         client.call.assert_called_once()
+
+    def test_account_summary_excludes_raw_identity(self):
+        from backend.bot_views import parse_view, view
+
+        client = SimpleNamespace(account_state={"Info": {"LV": 42, "Name": "fixture-private", "CUID": "fixture-id"}})
+        details = view(SimpleNamespace(client=client), parse_view("summary"))
+        self.assertIn("42", details[0])
+        self.assertNotIn("fixture", str(details))
+        self.assertIsNone(parse_view("summary 2"))
