@@ -5,16 +5,46 @@ import json
 import re
 import time
 import unicodedata
+from pathlib import Path
 
 from .game_client import GameError, TaskDeferred
 from .runtime_data import pinned
 
 
-LONG_TASKS = {"activity", "abyss", "buy_batch"}
+LONG_TASKS = {"activity", "abyss", "buy_batch", "refresh_secret_paid"}
 SHOP_TASKS = {"refresh_secret", "refresh_star_source"}
 QUERIES = {"activity", "abyss"}
 MAX_SHOP_ROUNDS = 200
 STAR_SOURCE_QUOTE_UNAVAILABLE = "当前缺少可核实的星源商店刷新报价，本次未提交刷新。"
+SECRET_SHOP_QUOTE = Path(__file__).resolve().parents[1] / "assets" / "secret_shop_diamond_quote.json"
+
+
+def secret_shop_paid_order(code):
+    try:
+        order = json.loads(code)
+        policy = json.loads(SECRET_SHOP_QUOTE.read_bytes())
+    except (OSError, ValueError, RecursionError):
+        return None
+    if not isinstance(order, dict) or set(order) != {"count", "quote", "budget", "scheme"}:
+        return None
+    count, scheme = order["count"], order["scheme"]
+    if type(count) is not int or not 1 <= count <= MAX_SHOP_ROUNDS:
+        return None
+    if scheme is not None and (not isinstance(scheme, dict) or not isinstance(scheme.get("slots"), dict)):
+        return None
+    if not isinstance(policy, dict):
+        return None
+    quote = {key: policy.get(key) for key in ("gameVersion", "catalog", "currency", "unitPrice")}
+    if (quote["currency"] != "2" or type(quote["unitPrice"]) is not int or quote["unitPrice"] < 1
+            or not isinstance(quote["gameVersion"], str) or not isinstance(quote["catalog"], str)
+            or not isinstance(order["quote"], dict) or type(order["quote"].get("unitPrice")) is not int
+            or order["quote"] != quote or type(order["budget"]) is not int
+            or order["budget"] != count * quote["unitPrice"]):
+        return None
+    limits = policy.get("vipDailyLimits")
+    if not isinstance(limits, list) or not limits or any(type(value) is not int or value < 0 for value in limits):
+        return None
+    return count, quote, limits, scheme
 
 
 def parse_shop(task: str, code: str):
@@ -161,6 +191,62 @@ def refresh_shop(client, task, cancel, order=(1, "free"), scheme=None, *, prepar
     return "unconfirmed", ["游戏未返回可确认的秘密商店新货架。"]
 
 
+def refresh_secret_paid(client, args, cancel, progress):
+    from .tasks import _item_count, shop_reset
+
+    count, quote, limits, scheme = args
+    if (client.login_version, client.login_catalog) != (quote["gameVersion"], quote["catalog"]):
+        return "quote_unavailable", ["游戏版本或资源目录已变化，本次未提交钻石刷新。"]
+    state = client.account_state or {}
+    vip, save = state.get("VIPInfo"), state.get("AccountSaveData")
+    level = vip.get("LV") if isinstance(vip, dict) else None
+    used = save.get("RandomStoreDayRefreshCount") if isinstance(save, dict) else None
+    if type(level) is not int or not 0 <= level < len(limits) or type(used) is not int or used < 0:
+        return "not_started", ["当前账号的每日钻石刷新额度无法核实。"]
+    unit, currency = quote["unitPrice"], quote["currency"]
+    available = min(max(0, limits[level] - used), max(0, _item_count(state, currency)) // unit)
+    target = min(count, available)
+    confirmed = 0
+
+    def receipt():
+        return [f"申请 {count} 次，已确认刷新 {confirmed} 次，扣除 {confirmed * unit} 颗钻石。",
+                "自动购买 0 件。"]
+
+    if not target:
+        return "skipped", [*receipt(), "今日剩余额度或钻石余额不足。"]
+    for round_number in range(1, target + 1):
+        if cancel.is_set():
+            return "cancelled", receipt()
+        try:
+            result = shop_reset(client, use_gold=True, auto_buy_sids=[], equipment_scheme=scheme)
+        except TaskDeferred:
+            return ("partial" if confirmed else "not_started"), [*receipt(), "账号状态需要同步。"]
+        except Exception:
+            return "unconfirmed", [*receipt(), f"第 {round_number} 次结算待核对。"]
+        costs = result.get("costItems")
+        if not isinstance(costs, list) or not costs or any(
+                not isinstance(row, dict) or not isinstance(row.get("Item"), dict)
+                or type(row["Item"].get("Count")) is not int or row["Item"]["Count"] <= 0 for row in costs):
+            return "unconfirmed", [*receipt(), f"第 {round_number} 次扣款待核对。"]
+        if any(str(row["Item"].get("StaticID")) != currency for row in costs) or sum(
+                row["Item"]["Count"] for row in costs) != unit:
+            return "unexpected_cost", [*receipt(), f"第 {round_number} 次实际扣款与确认报价不符。"]
+        if not result.get("records"):
+            return "unconfirmed", [*receipt(), f"第 {round_number} 次已确认扣除 {unit} 颗钻石，货架结果待核对。"]
+        confirmed += 1
+        progress(receipt()[0])
+        if not result.get("ok"):
+            return "partial", [*receipt(), "本轮货架的装备筛选未完成，已停止后续刷新。"]
+        matches = match_details(result.get("legendaryMatches")) if scheme else []
+        if matches:
+            return "shop_hit", [*receipt(), f"命中 {len(matches)} 件装备。", *matches]
+        if round_number < target and cancel.wait(0.3):
+            return "cancelled", receipt()
+    if confirmed < count:
+        return "partial", [*receipt(), "已达到今日剩余额度或可负担次数。"]
+    return "ok", receipt()
+
+
 def buy(client, picks, cancel, progress):
     from .tasks import _buy_payload, _collect_items, _item_count, _oid
 
@@ -303,5 +389,6 @@ def run(account, task, args, cancel, progress):
             order, scheme = args
             return refresh_shop(account.client, task, cancel, order, scheme, prepare=account.prepare_guild_for_qq_locked)
         account.prepare_guild_for_qq_locked()
-        runner = {"activity": activity, "abyss": abyss, "buy_batch": buy}[task]
+        runner = {"activity": activity, "abyss": abyss, "buy_batch": buy,
+                  "refresh_secret_paid": refresh_secret_paid}[task]
         return runner(account.client, args, cancel, progress)

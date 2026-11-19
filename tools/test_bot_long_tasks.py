@@ -1,3 +1,4 @@
+import json
 import threading
 import unittest
 from types import SimpleNamespace
@@ -130,6 +131,55 @@ class ActivityTests(unittest.TestCase):
 
 
 class ShopRefreshTests(unittest.TestCase):
+    def test_secret_shop_paid_order_requires_an_exact_quote_and_budget(self):
+        policy = json.loads(long.SECRET_SHOP_QUOTE.read_bytes())
+        quote = {key: policy[key] for key in ("gameVersion", "catalog", "currency", "unitPrice")}
+        order = {"count": 90, "quote": quote, "budget": 270, "scheme": None}
+        self.assertEqual(long.secret_shop_paid_order(json.dumps(order))[:3], (90, quote, policy["vipDailyLimits"]))
+        for unapproved in ({**order, "budget": 269}, {**order, "count": 201},
+                           {**order, "quote": {**quote, "unitPrice": 2}}):
+            with patch("backend.appcore._bootstrap_and_register") as login:
+                result = dispatch({"action": "run", "task": "refresh_secret_paid", "code": json.dumps(unapproved)})
+            self.assertEqual(result["status"], "quote_unavailable")
+            login.assert_not_called()
+
+    def test_paid_secret_shop_stops_at_quota_and_on_changed_debit_or_equipment_hit(self):
+        policy = json.loads(long.SECRET_SHOP_QUOTE.read_bytes())
+        quote = {key: policy[key] for key in ("gameVersion", "catalog", "currency", "unitPrice")}
+        scheme = {"slots": {"ring": [{"sets": ["Speed"]}]}}
+        args = long.secret_shop_paid_order(json.dumps({"count": 90, "quote": quote, "budget": 270, "scheme": scheme}))
+        account_state = {"VIPInfo": {"LV": 7}, "AccountSaveData": {"RandomStoreDayRefreshCount": 88},
+                         "ItemContainer": {"Items": [{"StaticID": "2", "Count": 300}]}}
+        client = SimpleNamespace(login_version=quote["gameVersion"], login_catalog=quote["catalog"],
+                                 account_state=account_state)
+        paid = {"ok": True, "records": [{"Store": "SecretShop"}],
+                "costItems": [{"Item": {"StaticID": "2", "Count": 3}}]}
+        cases = (
+            ([paid, paid], "partial", "已确认刷新 2 次", 2),
+            ([paid, {**paid, "costItems": [{"Item": {"StaticID": "2", "Count": 4}}]}],
+             "unexpected_cost", "已确认刷新 1 次", 2),
+            ([{**paid, "legendaryMatches": [{"index": 1, "setCN": "速度", "slotCN": "戒指"}]}],
+             "shop_hit", "已确认刷新 1 次", 1),
+        )
+        for results, expected, summary, calls in cases:
+            cancel = Mock(spec=threading.Event, **{"is_set.return_value": False, "wait.return_value": False})
+            with self.subTest(status=expected), patch("backend.tasks.shop_reset", side_effect=results) as reset:
+                status, details = long.refresh_secret_paid(client, args, cancel, Mock())
+                self.assertEqual(status, expected)
+                self.assertIn(summary, details[0])
+                self.assertEqual(reset.call_count, calls)
+                self.assertTrue(all(call.kwargs == {"use_gold": True, "auto_buy_sids": [],
+                                                    "equipment_scheme": scheme} for call in reset.call_args_list))
+        client.login_catalog = "catalog_999999"
+        with patch("backend.tasks.shop_reset") as reset:
+            self.assertEqual(long.refresh_secret_paid(client, args, threading.Event(), Mock())[0], "quote_unavailable")
+            reset.assert_not_called()
+        client.login_catalog = quote["catalog"]
+        client.account_state["ItemContainer"]["Items"][0]["Count"] = 2
+        with patch("backend.tasks.shop_reset") as reset:
+            self.assertEqual(long.refresh_secret_paid(client, args, threading.Event(), Mock())[0], "skipped")
+            reset.assert_not_called()
+
     def test_secret_shop_cooldown_needs_no_live_guild_preflight(self):
         client = SimpleNamespace(account_state={}, call=Mock())
         prepare = Mock()

@@ -147,7 +147,7 @@ def dispatch(request: dict, *, cancel=None, progress=None) -> dict:
     extended_tasks = (bot_long_tasks.LONG_TASKS | bot_long_tasks.SHOP_TASKS | account_actions
                       | {"long_info", "account_view", "filter_preview"})
     if (action != "run" or task not in (TASKS.keys() | PHASE_TWO | extended_tasks)
-            or not isinstance(code, str) or len(code) > (2300 if task in bot_long_tasks.SHOP_TASKS | {"filter_preview"} else 255)
+            or not isinstance(code, str) or len(code) > (2400 if task in bot_long_tasks.SHOP_TASKS | {"filter_preview", "refresh_secret_paid"} else 255)
             or (task == "redeem" and not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", code))
             or (task == "donate" and code not in DONATION_CAPS)
             or (task == "stages" and code not in {"hunt", "elf"})
@@ -185,6 +185,12 @@ def dispatch(request: dict, *, cancel=None, progress=None) -> dict:
             return {"status": "invalid"}
         if task == "refresh_star_source":
             return {"status": "quote_unavailable", "details": [bot_long_tasks.STAR_SOURCE_QUOTE_UNAVAILABLE]}
+        if args[0][1] == "diamond":
+            return {"status": "quote_unavailable", "details": ["钻石刷新需要先确认本次报价。"]}
+    elif task == "refresh_secret_paid":
+        args = bot_long_tasks.secret_shop_paid_order(code)
+        if args is None:
+            return {"status": "quote_unavailable", "details": ["确认报价已失效，请重新发起。"]}
     elif task in bot_long_tasks.LONG_TASKS or task == "long_info":
         args = code if task == "long_info" and code in bot_long_tasks.QUERIES else bot_long_tasks.parse(task, code)
         if args is None:

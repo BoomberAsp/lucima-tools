@@ -143,6 +143,8 @@ class GameClient:
         self._login_common = dict(login_common or config.LOGIN_COMMON_WEBGL)
         self._auth_refresher = auth_refresher
         self.login_id: str | None = None
+        self.login_version: str | None = None
+        self.login_catalog: str | None = None
         self.aid: str | None = None
         self.session_id: str | None = None
         self.account_state: dict[str, Any] | None = None
@@ -932,6 +934,9 @@ class GameClient:
         self.aid = state.get("Info", {}).get("_id", {}).get("$oid")
         if not self.session_id or not self.aid:
             raise GameError("Login 未返回 SessionID/AID")
+        bulletin_info = bulletin.get("Info", bulletin) if isinstance(bulletin, dict) else None
+        self.login_version = version
+        self.login_catalog = bulletin_info.get("NewCatalogName") if isinstance(bulletin_info, dict) else None
         self._replace_account_state(state)
         self._mark_connected()
         return state
