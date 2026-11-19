@@ -13,14 +13,14 @@ from .runtime_data import pinned
 LONG_TASKS = {"activity", "abyss", "buy_batch"}
 SHOP_TASKS = {"refresh_secret", "refresh_star_source"}
 QUERIES = {"activity", "abyss"}
-MAX_SHOP_ROUNDS = 20
+MAX_SHOP_ROUNDS = 200
 
 
 def parse_shop(task: str, code: str):
     words = unicodedata.normalize("NFKC", code).split()
     if not words:
         return 1, "free" if task == "refresh_secret" else "star"
-    if not re.fullmatch(r"[1-9][0-9]?", words[0]) or int(words[0]) > MAX_SHOP_ROUNDS:
+    if not re.fullmatch(r"[1-9][0-9]{0,2}", words[0]) or int(words[0]) > MAX_SHOP_ROUNDS:
         return None
     count = int(words[0])
     if task == "refresh_star_source" and len(words) == 1:
@@ -108,6 +108,24 @@ def query(state, kind):
     return [row["id"] for row in abyss_scenes(state)[:8]] or ["暂无可选关卡"]
 
 
+def match_details(cards, position_key):
+    """Keep the result card display-only. It never authorizes a purchase by position."""
+    if not isinstance(cards, list):
+        return []
+    matches = []
+    for card in cards:
+        if not isinstance(card, dict) or type(position := card.get(position_key)) is not int or not 0 <= position < 6:
+            continue
+        fields = [card.get(key) for key in ("tierName", "setCN", "slotCN", "staticID")]
+        label = " · ".join(value[:30] for value in fields if isinstance(value, str) and value)
+        if not label:
+            continue
+        score = card.get("auxScore")
+        suffix = f" · {score} 分" if type(score) in {int, float} and 0 <= score <= 10000 else ""
+        matches.append(f"第 {position + 1} 档 · {label}{suffix}")
+    return matches[:6]
+
+
 def refresh_shop(client, task, cancel, order=(1, "free"), scheme=None):
     from .tasks import (
         _collect_items, _fmt_items, _record_goods_sid, item_name, secret_shop_next_free,
@@ -125,14 +143,15 @@ def refresh_shop(client, task, cancel, order=(1, "free"), scheme=None):
             return "skipped", ["游戏返回免费刷新未就绪。"]
         records = result.get("records") or []
         details = [f"申请 {count} 次，实际刷新 1 次。新货架 {len(records)} 档。", "自动购买 0 件。"]
-        if scheme:
-            details.append(f"过滤方案命中 {len(result.get('legendaryMatches') or [])} 件装备。")
         for index, record in enumerate(records[:6], 1):
             sid = _record_goods_sid(record)
             details.append(f"第 {index} 档 · {item_name(str(sid)) if sid else '装备'}")
         if result.get("costItems"):
             return "unexpected_cost", details
         if records and result.get("ok"):
+            matches = match_details(result.get("legendaryMatches"), "index") if scheme else []
+            if matches:
+                return "shop_hit", [details[0], f"命中 {len(matches)} 件 · 自动购买 0 件。", *matches]
             return "ok", details
         return "unconfirmed", ["游戏未返回可确认的秘密商店新货架。"]
 
@@ -150,12 +169,13 @@ def refresh_shop(client, task, cancel, order=(1, "free"), scheme=None):
         return "unconfirmed", ["游戏未返回可确认的星源商店新刷新计数。"]
     cards = result.get("cards") or []
     details = [f"刷新计数 {before} → {after}，返回 {len(cards)} 件装备，自动购买 0 件。"]
-    if scheme:
-        details.append(f"过滤方案命中 {len(result.get('matches') or [])} 件装备。")
     spent = {}
     _collect_items(result.get("costItems"), spent)
     if spent:
         details.append(f"游戏返回扣款 {_fmt_items(spent)}")
+    matches = match_details(result.get("matches"), "shopIndex") if scheme else []
+    if matches:
+        return "shop_hit", [*details, f"命中 {len(matches)} 件装备。", *matches]
     for card in cards[:3]:
         details.append(" · ".join(str(card.get(key) or "") for key in ("tierName", "setCN", "slotCN", "staticID")))
     return "ok", details

@@ -104,7 +104,9 @@ class ShopRefreshTests(unittest.TestCase):
     def test_free_count_is_bounded_and_paid_refreshes_need_quotes(self):
         self.assertEqual(long.parse_shop("refresh_secret", "５ free"), (5, "free"))
         self.assertIsNone(long.parse_shop("refresh_star_source", "1.5"))
-        self.assertIsNone(long.parse_shop("refresh_star_source", "21"))
+        self.assertEqual(long.parse_shop("refresh_star_source", "２００"), (200, "star"))
+        self.assertEqual(long.parse_shop("refresh_secret", "200 free"), (200, "free"))
+        self.assertIsNone(long.parse_shop("refresh_star_source", "201"))
         client = SimpleNamespace(account_state={}, _auth_data=lambda data: data, call=Mock(return_value={
             "Records": [{"Store": "SecretShop", "StaticID": "fixture"}],
         }))
@@ -117,10 +119,38 @@ class ShopRefreshTests(unittest.TestCase):
                          "quote_unavailable")
         client.call.assert_not_called()
         client.call.return_value = {"Data": {"RefreshCount": 2}}
-        self.assertEqual(long.refresh_shop(client, "refresh_star_source", threading.Event(), (5, "star"))[0],
+        self.assertEqual(long.refresh_shop(client, "refresh_star_source", threading.Event(), (200, "star"))[0],
                          "quote_unavailable")
         self.assertEqual(client.call.call_args.args[0], "CustomEquipHandler.Query")
         client.call.assert_called_once()
+
+    def test_shop_match_returns_only_filtered_equipment_and_waits(self):
+        client = SimpleNamespace(account_state={})
+        scheme = {"slots": {"ring": [{"sets": ["Speed"]}]}}
+        equipment = {"shopIndex": 1, "tierName": "传说", "setCN": "速度", "slotCN": "戒指", "auxScore": 62}
+        with patch("backend.tasks.star_source_query", return_value={"ok": True, "refreshCount": 3}), patch(
+                "backend.tasks.star_source_refresh", return_value={
+                    "ok": True, "refreshCount": 4, "cards": [equipment, {"staticID": "unmatched-fixture"}],
+                    "matches": [equipment],
+                }) as refresh:
+            status, facts = long.refresh_shop(client, "refresh_star_source", threading.Event(), (1, "star"), scheme)
+        self.assertEqual(status, "shop_hit")
+        self.assertIn("第 2 档 · 传说 · 速度 · 戒指 · 62 分", facts)
+        self.assertNotIn("unmatched-fixture", str(facts))
+        refresh.assert_called_once_with(client, scheme)
+
+    def test_secret_shop_yields_a_match_only_after_confirming_free_refresh(self):
+        client = SimpleNamespace(account_state={})
+        rows = {"ok": True, "records": [{"Store": "SecretShop"}],
+                "legendaryMatches": [{"index": 0, "setCN": "速度", "slotCN": "鞋子"}]}
+        with patch("backend.tasks.shop_reset", return_value=rows) as reset:
+            status, details = long.refresh_shop(client, "refresh_secret", threading.Event(), (200, "free"), {"slots": {}})
+            self.assertEqual(status, "shop_hit")
+            self.assertIn("第 1 档 · 速度 · 鞋子", details)
+            self.assertEqual(reset.call_count, 1)
+            rows["costItems"] = [{"Item": {"StaticID": "2", "Count": 1}}]
+            self.assertEqual(long.refresh_shop(client, "refresh_secret", threading.Event(), (200, "free"), {"slots": {}})[0],
+                             "unexpected_cost")
 
     def test_star_source_reads_state_then_refreshes_once(self):
         client = SimpleNamespace(_auth_data=lambda data: data, call=Mock(side_effect=[
