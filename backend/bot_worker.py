@@ -133,15 +133,19 @@ def dispatch(request: dict, *, cancel=None, progress=None) -> dict:
     code = request.get("code", "")
     if not isinstance(task, str):
         return {"status": "invalid"}
-    long_task = task in bot_long_tasks.LONG_TASKS or task == "long_info"
-    if (action != "run" or task not in (TASKS.keys() | PHASE_TWO | bot_long_tasks.LONG_TASKS | {"long_info"})
+    extended_tasks = bot_long_tasks.LONG_TASKS | bot_long_tasks.SHOP_TASKS | {"long_info"}
+    if (action != "run" or task not in (TASKS.keys() | PHASE_TWO | extended_tasks)
             or not isinstance(code, str) or len(code) > 255
             or (task == "redeem" and not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", code))
             or (task == "donate" and code not in DONATION_CAPS)
             or (task == "stages" and code not in {"hunt", "elf"})
-            or (task == "equipment" and len(code) > 24)):
+            or (task == "equipment" and len(code) > 24)
+            or (task in bot_long_tasks.SHOP_TASKS and code)):
         return {"status": "invalid"}
-    if long_task:
+    if task == "long_info" and code == "shop":
+        return {"status": "ok", "details": bot_long_tasks.shop_reference()}
+    args = None
+    if task in bot_long_tasks.LONG_TASKS or task == "long_info":
         args = code if task == "long_info" and code in bot_long_tasks.QUERIES else bot_long_tasks.parse(task, code)
         if args is None:
             return {"status": "invalid"}
@@ -156,13 +160,15 @@ def dispatch(request: dict, *, cancel=None, progress=None) -> dict:
             auth.update(updated)
         return auth
 
+    bootstrapped = False
     try:
         with maintenance.operation_scope():
             if cancel is not None and cancel.is_set():
                 return {"status": "cancelled"}
             refresh()
             account = appcore._bootstrap_and_register(account_id, auth, auth_refresher=refresh)
-            if long_task:
+            bootstrapped = True
+            if task in extended_tasks:
                 status, details = bot_long_tasks.run(account, task, args, cancel or threading.Event(),
                                                       progress or (lambda message: None))
                 if (status in {"ok", "skipped", "cancelled"}
@@ -210,6 +216,8 @@ def dispatch(request: dict, *, cancel=None, progress=None) -> dict:
             return {"status": "deferred", "auth": auth}
         if isinstance(error, PortalError) or error.status == 401:
             return {"status": "auth_expired"}
+        if not bootstrapped:
+            return {"status": "game_login_failed", "auth": auth}
         return {"status": "unconfirmed", "auth": auth}
     except DuplicateLoginError:
         return {"status": "duplicate_login", "auth": auth}

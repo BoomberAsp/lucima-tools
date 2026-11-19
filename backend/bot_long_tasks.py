@@ -2,13 +2,15 @@
 from __future__ import annotations
 
 import re
+import time
 
 from .game_client import GameError
 from .runtime_data import pinned
 
 
 LONG_TASKS = {"activity", "abyss", "buy_batch"}
-QUERIES = {"activity", "abyss", "shop"}
+SHOP_TASKS = {"refresh_secret", "refresh_star_source"}
+QUERIES = {"activity", "abyss"}
 
 
 def parse(task: str, code: str):
@@ -46,6 +48,18 @@ def shop_rows(state):
             if row["hasRecord"] and row["id"] != "VIPGIFT_VIPQuick4"}
 
 
+@pinned
+def shop_reference():
+    from .tasks import store_shelves
+
+    goods = [row for shelf in store_shelves({}) for row in shelf["goods"]
+             if row["id"] != "VIPGIFT_VIPQuick4"]
+    return ["静态商品参考价，余额和可购数量在执行前核对。", *[
+        f"{row['id']} {row['name']} · 货币 {row['cost']['item']} · 单价 {row['cost']['count']}"
+        for row in goods[:7]
+    ]]
+
+
 def query(state, kind):
     from .activity_progress import cleared, records, scenes
     from .tasks import abyss_scenes
@@ -58,10 +72,51 @@ def query(state, kind):
         teams = [str(row["ID"]) for row in state.get("Teams", {}).get("Settings", [])
                  if row.get("TeamSetting", {}).get("RolePosMap")]
         return ["活动 ID " + ("、".join(families[:12]) or "暂无"), "队伍 ID " + ("、".join(teams[:12]) or "暂无")]
-    if kind == "abyss":
-        return [row["id"] for row in abyss_scenes(state)[:8]] or ["暂无可选关卡"]
-    return [f"{sid} {row['name']} · 货币 {row['cost']['item']} · 单价 {row['cost']['count']}"
-            for sid, row in shop_rows(state).items() if row["remain"] != 0][:8] or ["暂无可报价商品"]
+    return [row["id"] for row in abyss_scenes(state)[:8]] or ["暂无可选关卡"]
+
+
+def refresh_shop(client, task, cancel):
+    from .tasks import (
+        _collect_items, _fmt_items, _record_goods_sid, item_name, secret_shop_next_free,
+        shop_reset, star_source_query, star_source_refresh,
+    )
+    if task == "refresh_secret":
+        next_free = secret_shop_next_free(client.account_state or {})
+        if next_free is not None and next_free > time.time() * 1000:
+            return "skipped", ["秘密商店的免费刷新仍在冷却。"]
+        result = shop_reset(client, use_gold=False, auto_buy_sids=[])
+        if not result.get("ok") and str(result.get("error", "")).replace(" ", "").casefold() == "cantreset":
+            return "skipped", ["游戏返回免费刷新未就绪。"]
+        records = result.get("records") or []
+        details = [f"新货架共 {len(records)} 档，自动购买 0 件。"]
+        for index, record in enumerate(records[:6], 1):
+            sid = _record_goods_sid(record)
+            details.append(f"第 {index} 档 · {item_name(str(sid)) if sid else '装备'}")
+        if result.get("costItems"):
+            return "unexpected_cost", details
+        if records and result.get("ok"):
+            return "ok", details
+        return "unconfirmed", ["游戏未返回可确认的秘密商店新货架。"]
+
+    initial = star_source_query(client)
+    before = initial.get("refreshCount")
+    if not initial.get("ok") or type(before) is not int or before < 0:
+        return "skipped", ["星源商店的刷新状态不可用，未提交刷新。"]
+    if cancel.is_set():
+        return "cancelled", []
+    result = star_source_refresh(client, {})
+    after = result.get("refreshCount")
+    if not result.get("ok") or type(after) is not int or after == before:
+        return "unconfirmed", ["游戏未返回可确认的星源商店新刷新计数。"]
+    cards = result.get("cards") or []
+    details = [f"刷新计数 {before} → {after}，返回 {len(cards)} 件装备，自动购买 0 件。"]
+    spent = {}
+    _collect_items(result.get("costItems"), spent)
+    if spent:
+        details.append(f"游戏返回扣款 {_fmt_items(spent)}")
+    for card in cards[:3]:
+        details.append(" · ".join(str(card.get(key) or "") for key in ("tierName", "setCN", "slotCN", "staticID")))
+    return "ok", details
 
 
 def buy(client, picks, cancel, progress):
@@ -188,5 +243,7 @@ def run(account, task, args, cancel, progress):
             return "cancelled", []
         if task == "long_info":
             return "ok", query(account.client.account_state or {}, args)
+        if task in SHOP_TASKS:
+            return refresh_shop(account.client, task, cancel)
         runner = {"activity": activity, "abyss": abyss, "buy_batch": buy}[task]
         return runner(account.client, args, cancel, progress)

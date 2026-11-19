@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from backend import bot_long_tasks as long
+from backend.bot_worker import dispatch
 
 
 class PurchaseTests(unittest.TestCase):
@@ -68,3 +69,48 @@ class AbyssTests(unittest.TestCase):
         validate.assert_called_once_with(client.account_state, *args)
         run.assert_called_once()
         self.assertEqual(set(run.call_args.args[1]), {"sceneId", "waves", "_cancel_event", "_on_progress"})
+
+
+class ShopRefreshTests(unittest.TestCase):
+    def test_reference_quotes_need_no_game_session(self):
+        with patch("backend.appcore._bootstrap_and_register") as login:
+            result = dispatch({"action": "run", "task": "long_info", "code": "shop"})
+        login.assert_not_called()
+        self.assertEqual(result["status"], "ok")
+        self.assertIn("参考价", result["details"][0])
+        self.assertIn("单价", result["details"][1])
+
+    def test_game_login_failure_is_distinguished_from_unknown_settlement(self):
+        from backend.appcore import ApiError
+
+        request = {"action": "run", "task": "long_info", "code": "activity",
+                   "auth": {"user_id": "fixture", "access_token": "fixture"}}
+        with patch("backend.portal.access_token_needs_refresh", return_value=False), patch(
+            "backend.appcore._bootstrap_and_register", side_effect=ApiError(400, "raw upstream data"),
+        ):
+            result = dispatch(request)
+        self.assertEqual(result["status"], "game_login_failed")
+        self.assertNotIn("raw upstream data", str(result))
+
+    def test_secret_shop_uses_only_the_free_refresh(self):
+        client = SimpleNamespace(account_state={}, _auth_data=lambda data: data, call=Mock(return_value={
+            "Records": [{"Store": "SecretShop", "StaticID": "fixture"}],
+        }))
+        status, details = long.refresh_shop(client, "refresh_secret", threading.Event())
+        self.assertEqual(status, "ok")
+        client.call.assert_called_once_with("StoreHandler.ResetRandomStore", {"StoreID": "SecretShop", "IsUseGold": 0})
+        self.assertIn("自动购买 0 件", details[0])
+
+    def test_star_source_reads_state_then_refreshes_once(self):
+        client = SimpleNamespace(_auth_data=lambda data: data, call=Mock(side_effect=[
+            {"Data": {"RefreshCount": 2}}, {"Data": {"RefreshCount": 3}},
+        ]))
+        self.assertEqual(long.refresh_shop(client, "refresh_star_source", threading.Event())[0], "ok")
+        self.assertEqual([call.args[0] for call in client.call.call_args_list], [
+            "CustomEquipHandler.Query", "CustomEquipHandler.RefreshEquip",
+        ])
+
+    def test_star_source_skips_if_refresh_count_is_unavailable(self):
+        client = SimpleNamespace(_auth_data=lambda data: data, call=Mock(return_value={"Data": {}}))
+        self.assertEqual(long.refresh_shop(client, "refresh_star_source", threading.Event())[0], "skipped")
+        client.call.assert_called_once()

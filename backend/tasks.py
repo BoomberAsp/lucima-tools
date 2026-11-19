@@ -1589,6 +1589,7 @@ def shop_reset(c: GameClient, use_gold: bool, auto_buy_sids: list,
                              f"无法判定是否为85级传说，已中止本次刷新——请补充 backend/equip_ref.json",
                     "records": records, "bought": counter,
                     "boughtLines": lines, "legendaries": legendaries,
+                    "costItems": res.get("CostItems") or [],
                 }
             if is85:
                 card = parse_equipment(equip)
@@ -1617,6 +1618,7 @@ def shop_reset(c: GameClient, use_gold: bool, auto_buy_sids: list,
         "ok": True, "records": records, "bought": counter,
         "boughtLines": lines, "buyErrors": buy_errors,
         "legendaries": legendaries, "legendaryMatches": legendary_matches,
+        "costItems": res.get("CostItems") or [],
     }
 
 
@@ -1669,6 +1671,7 @@ def _star_source_refresh_result(res: dict, scheme: dict) -> dict:
         "matches": matches,
         "refreshCount": data.get("RefreshCount"),
         "revertTime": data.get("RevertTime"),
+        "costItems": res.get("CostItems") or data.get("CostItems") or [],
     }
 
 
