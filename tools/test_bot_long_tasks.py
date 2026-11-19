@@ -7,8 +7,80 @@ from unittest.mock import Mock, patch
 import httpx
 
 from backend import bot_long_tasks as long
+from backend import bot_shop_purchase as shop
 from backend.bot_worker import dispatch
 from backend.game_client import GameError, TaskDeferred
+
+
+class ShopPurchasesTests(unittest.TestCase):
+    def test_confirmed_secret_refresh_buys_only_selected_ordinary_items(self):
+        quote = json.loads(long.SECRET_SHOP_QUOTE.read_bytes())
+        quote = {key: quote[key] for key in ("gameVersion", "catalog", "currency", "unitPrice")}
+        code = json.dumps({"count": 1, "quote": quote, "budget": 3, "scheme": None, "targets": ["recruit"]})
+        args = long.secret_shop_paid_order(code)
+        token = {"Item": {"StaticID": "5", "Count": 5}}
+        other = {"Item": {"StaticID": "6", "Count": 5}}
+        records = [{"DropResult": {"Items": [item]}, "Store": "SecretShop"} for item in (token, other)]
+        client = SimpleNamespace(login_version=quote["gameVersion"], login_catalog=quote["catalog"],
+                                 account_state={"VIPInfo": {"LV": 7}, "AccountSaveData": {"RandomStoreDayRefreshCount": 0},
+                                                "ItemContainer": {"Items": [{"StaticID": "2", "Count": 3}]}},
+                                 _auth_data=lambda data: data, call=Mock(side_effect=[
+                                     {"Records": records, "CostItems": [{"Item": {"StaticID": "2", "Count": 3}}]},
+                                     {"Drop": {"Items": [token]}, "CostItems": [{"Item": {"StaticID": "1", "Count": 20000}}]},
+                                 ]))
+        status, details = long.refresh_secret_paid(client, args, threading.Event(), Mock())
+        self.assertEqual(status, "ok")
+        self.assertIn("自动购买 1", details[1])
+        self.assertIn("金币 ×20000", details[1])
+        self.assertEqual([call.args[0] for call in client.call.call_args_list],
+                         ["StoreHandler.ResetRandomStore", "StoreHandler.BuyCommodity"])
+        self.assertEqual(client.call.call_args.args[1]["Record"]["DropResult"]["Items"], [token])
+
+    def test_secret_equipment_purchase_accepts_verified_fingerprint_and_rejects_changed_shelf(self):
+        equipment = {"StaticID": "EQ01", "Set": "Speed", "MainProp": {"Value": 12}}
+        record = {"Store": "SecretShop", "_id": {"$oid": "record"}, "LastResetTime": {"$date": 100},
+                  "DropResult": {"Items": [{"Equipment": equipment}]}}
+        option = shop.secret_option(record, 2)
+        self.assertEqual(option["price"], {"currency": "1", "amount": None})
+        order = shop.confirmed_order(json.dumps({**option, "shop": "secret", "expires": 10**12}))
+        client = SimpleNamespace(account_state={"StoreRecordContainer": {"Records": [record]}},
+                                 _auth_data=lambda data: data, call=Mock(return_value={
+                                     "Drop": {"Items": [{"Equipment": equipment}]},
+                                     "CostItems": [{"Item": {"StaticID": "1", "Count": 500}}],
+                                 }))
+        record["LastResetTime"]["$date"] = 101
+        self.assertEqual(shop.buy_confirmed(client, order)[0], "skipped")
+        client.call.assert_not_called()
+        record["LastResetTime"]["$date"] = 100
+        self.assertIn("500 金币", shop.buy_confirmed(client, order)[1][0])
+        client.call.assert_called_once()
+
+    def test_star_source_free_refresh_pauses_before_buying_exact_equipment(self):
+        policy = shop.star_quote()
+        scheme = {"slots": {"ring": [{"sets": ["Speed"]}]}}
+        args = long.star_source_order(json.dumps({"count": 3, "quote": policy, "budget": 0, "scheme": scheme}))
+        ring = {"StaticID": "MATCH01", "Set": "Speed"}
+        shelf = {"shelf": [ring], "refreshCount": 9, "revertTime": 100}
+        result = {"ok": True, **shelf, "matches": [{"shopIndex": 0, "setCN": "速度"}], "costItems": []}
+        client = SimpleNamespace(login_version=policy["gameVersion"], login_catalog=policy["catalog"],
+                                 account_state={"ItemContainer": {"Items": [{"StaticID": "109", "Count": 20}]}},
+                                 call=Mock())
+        options = []
+        settled = {"ok": True, "Drop": {"Items": [{"Equipment": ring}]},
+                   "CostItems": [{"Item": {"StaticID": "109", "Count": 5}}]}
+        with patch("backend.tasks.star_source_query", side_effect=[{"ok": True, "refreshCount": 8}, shelf, shelf]), patch(
+            "backend.tasks.star_source_refresh", return_value=result,
+        ) as refresh, patch("backend.tasks.star_source_buy", return_value=settled) as buy:
+            status, details = long.refresh_star_source(client, args, threading.Event(), Mock(), options=options)
+            self.assertEqual(status, "shop_hit")
+            self.assertIn("不消耗货币", details[0])
+            refresh.assert_called_once()
+            buy.assert_not_called()
+            order = {**options[0], "shop": "star", "expires": 10**12}
+            self.assertEqual(shop.buy_confirmed(client, {**order, "key": "0" * 64})[0], "skipped")
+            buy.assert_not_called()
+            self.assertIn("5 彩虹星源", shop.buy_confirmed(client, order)[1][0])
+            buy.assert_called_once_with(client, 0, include_settlement=True)
 
 
 class PurchaseTests(unittest.TestCase):

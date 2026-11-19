@@ -179,18 +179,27 @@ def dispatch(request: dict, *, cancel=None, progress=None) -> dict:
         args = bot_views.parse_view(code)
         if args is None:
             return {"status": "invalid"}
-    elif task in bot_long_tasks.SHOP_TASKS:
+    elif task == "refresh_star_source":
+        args = bot_long_tasks.star_source_order(code)
+        if args is None:
+            if bot_long_tasks.parse_shop_request(task, code) is None:
+                return {"status": "invalid"} if not code.startswith("{") else {
+                    "status": "quote_unavailable", "details": [bot_long_tasks.STAR_SOURCE_QUOTE_UNAVAILABLE]}
+            return {"status": "quote_unavailable", "details": [bot_long_tasks.STAR_SOURCE_QUOTE_UNAVAILABLE]}
+    elif task == "refresh_secret":
         args = bot_long_tasks.parse_shop_request(task, code)
         if args is None:
             return {"status": "invalid"}
-        if task == "refresh_star_source":
-            return {"status": "quote_unavailable", "details": [bot_long_tasks.STAR_SOURCE_QUOTE_UNAVAILABLE]}
         if args[0][1] == "diamond":
             return {"status": "quote_unavailable", "details": ["钻石刷新需要先确认本次报价。"]}
     elif task == "refresh_secret_paid":
         args = bot_long_tasks.secret_shop_paid_order(code)
         if args is None:
             return {"status": "quote_unavailable", "details": ["确认报价已失效，请重新发起。"]}
+    elif task == "buy_shop_equipment":
+        args = bot_long_tasks.purchases.confirmed_order(code)
+        if args is None:
+            return {"status": "invalid"}
     elif task in bot_long_tasks.LONG_TASKS or task == "long_info":
         args = code if task == "long_info" and code in bot_long_tasks.QUERIES else bot_long_tasks.parse(task, code)
         if args is None:
@@ -227,12 +236,16 @@ def dispatch(request: dict, *, cancel=None, progress=None) -> dict:
                     details = bot_views.filter_preview(account.client.account_state or {}, args)
                 return {"status": "ok", "auth": auth, "details": details}
             if task in extended_tasks:
+                options = []
                 status, details = bot_long_tasks.run(account, task, args, cancel or threading.Event(),
-                                                      progress or (lambda message: None))
+                                                      progress or (lambda message: None), options=options)
                 if (status in {"ok", "skipped", "cancelled"}
                         and account.client.connection_status().get("reason") == "duplicate_login"):
                     status = "duplicate_login"
-                return {"status": status, "auth": auth, "details": details}
+                result = {"status": status, "auth": auth, "details": details}
+                if status == "shop_hit" and options:
+                    result["shopOptions"] = options
+                return result
             if task in PHASE_TWO:
                 status, details = phase_two(account, task, code)
                 if account.client.connection_status().get("reason") == "duplicate_login":

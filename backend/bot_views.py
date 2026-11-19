@@ -64,7 +64,7 @@ def view(account, args):
         result = star_source_query(client)
         count = result.get("refreshCount")
         count_text = str(count) if result.get("ok") and type(count) is int and count >= 0 else "未能同步"
-        return [f"星源商店刷新计数 {count_text}。", "暂无可核实的刷新报价，QQ 刷新暂不可用。"]
+        return [f"星源商店刷新计数 {count_text}。"]
     if name == "abyss_sweep":
         from .tasks import abyss_progress
 

@@ -7,11 +7,12 @@ import time
 import unicodedata
 from pathlib import Path
 
+from . import bot_shop_purchase as purchases
 from .game_client import GameError, TaskDeferred
 from .runtime_data import pinned
 
 
-LONG_TASKS = {"activity", "abyss", "buy_batch", "refresh_secret_paid"}
+LONG_TASKS = {"activity", "abyss", "buy_batch", "refresh_secret_paid", "refresh_star_source", "buy_shop_equipment"}
 SHOP_TASKS = {"refresh_secret", "refresh_star_source"}
 QUERIES = {"activity", "abyss"}
 MAX_SHOP_ROUNDS = 200
@@ -25,7 +26,8 @@ def secret_shop_paid_order(code):
         policy = json.loads(SECRET_SHOP_QUOTE.read_bytes())
     except (OSError, ValueError, RecursionError):
         return None
-    if not isinstance(order, dict) or set(order) != {"count", "quote", "budget", "scheme"}:
+    required = {"count", "quote", "budget", "scheme"}
+    if not isinstance(order, dict) or not required <= order.keys() <= required | {"targets"}:
         return None
     count, scheme = order["count"], order["scheme"]
     if type(count) is not int or not 1 <= count <= MAX_SHOP_ROUNDS:
@@ -44,7 +46,24 @@ def secret_shop_paid_order(code):
     limits = policy.get("vipDailyLimits")
     if not isinstance(limits, list) or not limits or any(type(value) is not int or value < 0 for value in limits):
         return None
-    return count, quote, limits, scheme
+    targets = purchases.parse_targets(order.get("targets", []))
+    return (count, quote, limits, scheme, targets) if targets is not None else None
+
+
+def star_source_order(code):
+    try:
+        order = json.loads(code)
+    except (ValueError, RecursionError):
+        return None
+    policy = purchases.star_quote()
+    if (not policy or not isinstance(order, dict) or set(order) != {"count", "quote", "budget", "scheme"}
+            or order["quote"] != policy or type(order["count"]) is not int
+            or not 1 <= order["count"] <= MAX_SHOP_ROUNDS
+            or type(order["budget"]) is not int or order["budget"] != order["count"] * policy["refresh"]["amount"]
+            or not isinstance(order["scheme"], dict) or not isinstance(order["scheme"].get("slots"), dict)
+            or not order["scheme"]["slots"]):
+        return None
+    return order["count"], policy, order["scheme"]
 
 
 def parse_shop(task: str, code: str):
@@ -63,18 +82,22 @@ def parse_shop(task: str, code: str):
 
 def parse_shop_request(task: str, code: str):
     scheme = None
+    targets = []
     if code.startswith("{"):
         try:
             body = json.loads(code)
         except (ValueError, RecursionError):
             return None
-        if not isinstance(body, dict) or set(body) != {"order", "scheme"}:
+        required = {"order", "scheme"}
+        if not isinstance(body, dict) or not required <= body.keys() <= required | {"targets"}:
             return None
         code, scheme = body["order"], body["scheme"]
-        if not isinstance(code, str) or not isinstance(scheme, dict) or not isinstance(scheme.get("slots"), dict):
+        targets = purchases.parse_targets(body.get("targets", []))
+        if (not isinstance(code, str) or targets is None
+                or scheme is not None and (not isinstance(scheme, dict) or not isinstance(scheme.get("slots"), dict))):
             return None
     order = parse_shop(task, code)
-    return (order, scheme) if order else None
+    return (order, scheme, targets) if order else None
 
 
 def parse(task: str, code: str):
@@ -139,13 +162,12 @@ def query(state, kind):
     return [row["id"] for row in abyss_scenes(state)[:8]] or ["暂无可选关卡"]
 
 
-def match_details(cards):
-    """Keep the result card display-only. It never authorizes a purchase by position."""
+def match_details(cards, position_key="index"):
     if not isinstance(cards, list):
         return []
     matches = []
     for card in cards:
-        if not isinstance(card, dict) or type(position := card.get("index")) is not int or not 0 <= position < 6:
+        if not isinstance(card, dict) or type(position := card.get(position_key)) is not int or not 0 <= position < 6:
             continue
         fields = [card.get(key) for key in ("tierName", "setCN", "slotCN", "staticID")]
         label = " · ".join(value[:30] for value in fields if isinstance(value, str) and value)
@@ -157,9 +179,27 @@ def match_details(cards):
     return matches[:6]
 
 
-def refresh_shop(client, task, cancel, order=(1, "free"), scheme=None, *, prepare=None):
+def secret_hits(result, scheme, options):
+    cards = result.get("legendaryMatches") if scheme else []
+    matches = match_details(cards)
+    found = []
+    if matches and options is not None:
+        records = result["records"]
+        for card in cards:
+            index = card.get("index") if isinstance(card, dict) else None
+            if type(index) is int and 0 <= index < min(len(records), 6):
+                if option := purchases.secret_option(records[index], index + 1):
+                    found.append(option)
+        options.extend(found)
+    if matches and len(found) < len(matches):
+        matches.append("部分命中装备的货架或结算货币无法核对，请在游戏内查看。")
+    return matches
+
+
+def refresh_shop(client, task, cancel, order=(1, "free"), scheme=None, targets=(), *, prepare=None, options=None):
     from .tasks import (
-        _record_goods_sid, item_name, secret_shop_next_free, shop_reset,
+        UnknownEquipmentError, _equipment_matches_in_shelf, _record_goods_sid, _secret_shop_records,
+        item_name, secret_shop_next_free, shop_reset,
     )
     count, mode = order
     if task == "refresh_star_source":
@@ -167,34 +207,56 @@ def refresh_shop(client, task, cancel, order=(1, "free"), scheme=None, *, prepar
     if mode != "free":
         return "quote_unavailable", ["当前游戏数据未提供可核实的钻石刷新报价。"]
     next_free = secret_shop_next_free(client.account_state or {})
-    if next_free is not None and next_free > time.time() * 1000:
-        return "skipped", [f"申请 {count} 次，实际刷新 0 次。免费额度仍在冷却。"]
-    if prepare is not None:
+    cooling = next_free is not None and next_free > time.time() * 1000
+    ledger = purchases.Purchases()
+    if prepare is not None and (targets or not cooling):
         prepare()
     if cancel.is_set():
         return "cancelled", []
+    current_records = _secret_shop_records(client.account_state or {})
+    if targets and (stop := ledger.buy(client, current_records, targets, cancel)):
+        return stop, [ledger.summary(), "当前货架购买未完整确认，未刷新。"]
+
+    def cooldown_result(message):
+        details = [message, ledger.summary()]
+        if scheme:
+            try:
+                cards = _equipment_matches_in_shelf(current_records, scheme)
+            except UnknownEquipmentError:
+                return ("partial" if ledger.count else "skipped"), [*details, "当前货架的装备数据待核对。"]
+            current = {"records": current_records, "legendaryMatches": cards}
+            if matches := secret_hits(current, scheme, options):
+                return "shop_hit", [*details, *matches]
+        return ("ok" if ledger.count else "skipped"), details
+
+    if cooling:
+        return cooldown_result(f"申请 {count} 次，实际刷新 0 次。免费额度仍在冷却。")
     result = shop_reset(client, use_gold=False, auto_buy_sids=[], equipment_scheme=scheme)
     if not result.get("ok") and str(result.get("error", "")).replace(" ", "").casefold() == "cantreset":
-        return "skipped", ["游戏返回免费刷新未就绪。"]
+        return cooldown_result("游戏返回免费刷新未就绪。")
     records = result.get("records") or []
-    details = [f"申请 {count} 次，实际刷新 1 次。新货架 {len(records)} 档。", "自动购买 0 件。"]
+    details = [f"申请 {count} 次，实际刷新 1 次。新货架 {len(records)} 档。"]
     for index, record in enumerate(records[:6], 1):
         sid = _record_goods_sid(record)
         details.append(f"第 {index} 档 · {item_name(str(sid)) if sid else '装备'}")
     if result.get("costItems"):
-        return "unexpected_cost", details
+        return "unexpected_cost", [details[0], ledger.summary(), *details[1:]]
     if records and result.get("ok"):
-        matches = match_details(result.get("legendaryMatches")) if scheme else []
+        stop = ledger.buy(client, records, targets, cancel) if targets else None
+        summary = ledger.summary() if targets else "自动购买 0 件。"
+        if stop:
+            return stop, [details[0], summary, "部分购买结算待核对，后续交易已停止。"]
+        matches = secret_hits(result, scheme, options)
         if matches:
-            return "shop_hit", [details[0], f"命中 {len(matches)} 件 · 自动购买 0 件。", *matches]
-        return "ok", details
-    return "unconfirmed", ["游戏未返回可确认的秘密商店新货架。"]
+            return "shop_hit", [details[0], summary, *matches]
+        return "ok", [details[0], summary, *details[1:]]
+    return "unconfirmed", ["游戏未返回可确认的秘密商店新货架。", ledger.summary()]
 
 
-def refresh_secret_paid(client, args, cancel, progress):
+def refresh_secret_paid(client, args, cancel, progress, *, options=None):
     from .tasks import _item_count, shop_reset
 
-    count, quote, limits, scheme = args
+    count, quote, limits, scheme, targets = args
     if (client.login_version, client.login_catalog) != (quote["gameVersion"], quote["catalog"]):
         return "quote_unavailable", ["游戏版本或资源目录已变化，本次未提交钻石刷新。"]
     state = client.account_state or {}
@@ -207,10 +269,11 @@ def refresh_secret_paid(client, args, cancel, progress):
     available = min(max(0, limits[level] - used), max(0, _item_count(state, currency)) // unit)
     target = min(count, available)
     confirmed = 0
+    ledger = purchases.Purchases()
 
     def receipt():
         return [f"申请 {count} 次，已确认刷新 {confirmed} 次，扣除 {confirmed * unit} 颗钻石。",
-                "自动购买 0 件。"]
+                ledger.summary() if targets else "自动购买 0 件。"]
 
     if not target:
         return "skipped", [*receipt(), "今日剩余额度或钻石余额不足。"]
@@ -237,13 +300,73 @@ def refresh_secret_paid(client, args, cancel, progress):
         progress(receipt()[0])
         if not result.get("ok"):
             return "partial", [*receipt(), "本轮货架的装备筛选未完成，已停止后续刷新。"]
-        matches = match_details(result.get("legendaryMatches")) if scheme else []
+        if targets and (stop := ledger.buy(client, result["records"], targets, cancel)):
+            return stop, [*receipt(), "本轮购买未完整确认，已停止后续刷新。"]
+        matches = secret_hits(result, scheme, options)
         if matches:
-            return "shop_hit", [*receipt(), f"命中 {len(matches)} 件装备。", *matches]
+            return "shop_hit", [*receipt(), *matches]
         if round_number < target and cancel.wait(0.3):
             return "cancelled", receipt()
     if confirmed < count:
         return "partial", [*receipt(), "已达到今日剩余额度或可负担次数。"]
+    return "ok", receipt()
+
+
+def refresh_star_source(client, args, cancel, progress, *, options=None):
+    from .tasks import _item_count, item_name, star_source_query, star_source_refresh
+
+    count, quote, scheme = args
+    if (client.login_version, client.login_catalog) != (quote["gameVersion"], quote["catalog"]):
+        return "quote_unavailable", ["星源商店报价对应的游戏版本已变化。"]
+    currency, unit = quote["refresh"]["currency"], quote["refresh"]["amount"]
+    initial = star_source_query(client)
+    used = initial.get("refreshCount")
+    if not initial.get("ok") or type(used) is not int or used < 0:
+        return "not_started", ["星源商店刷新计数无法核实。"]
+    confirmed = 0
+
+    def receipt():
+        spent = f"扣除 {confirmed * unit} {item_name(currency)}" if unit else "刷新不消耗货币"
+        return [f"申请 {count} 次，已确认刷新 {confirmed} 次，{spent}。"]
+
+    for i in range(count):
+        if cancel.is_set():
+            return "cancelled", receipt()
+        if unit and _item_count(client.account_state or {}, currency) < unit:
+            return ("partial" if confirmed else "skipped"), [*receipt(), "刷新货币余额不足。"]
+        try:
+            result = star_source_refresh(client, scheme, include_shelf=True)
+        except TaskDeferred:
+            return ("partial" if confirmed else "not_started"), [*receipt(), "账号状态需要同步。"]
+        except Exception:
+            return "unconfirmed", [*receipt(), "本轮刷新结果待核对。"]
+        if not result.get("ok"):
+            return ("partial" if confirmed else "skipped"), [*receipt(), "游戏拒绝刷新。"]
+        debit = purchases.costs(result.get("costItems"))
+        if debit is None or type(result.get("refreshCount")) is not int:
+            return "unconfirmed", [*receipt(), "本轮刷新扣款或计数待核对。"]
+        if debit != ({currency: unit} if unit else {}):
+            return "unexpected_cost", [*receipt(), "本轮实际扣款与报价不符。"]
+        if result["refreshCount"] != used + 1 or not result.get("shelf"):
+            return "unconfirmed", [*receipt(), "星源商店货架已变化，结果待核对。"]
+        used += 1
+        confirmed += 1
+        progress(receipt()[0])
+        matches = match_details(result["matches"], "shopIndex")
+        if matches:
+            found = []
+            for card in result["matches"]:
+                slot = card["shopIndex"]
+                if 0 <= slot < len(result["shelf"]):
+                    if option := purchases.star_option(result["shelf"][slot], slot + 1, result, quote.get("equipment")):
+                        found.append(option)
+            if options is not None:
+                options.extend(found)
+            if len(found) < len(matches):
+                matches.append("缺少可核实报价或货架标识的装备需在游戏内购买。")
+            return "shop_hit", [*receipt(), *matches]
+        if i + 1 < count and cancel.wait(0.3):
+            return "cancelled", receipt()
     return "ok", receipt()
 
 
@@ -378,17 +501,22 @@ def abyss(client, args, cancel, progress):
 
 
 @pinned
-def run(account, task, args, cancel, progress):
+def run(account, task, args, cancel, progress, *, options=None):
     with account.lock, account._request_scope():
         account.require_current_day()
         if cancel.is_set():
             return "cancelled", []
         if task == "long_info":
             return "ok", query(account.client.account_state or {}, args)
-        if task in SHOP_TASKS:
-            order, scheme = args
-            return refresh_shop(account.client, task, cancel, order, scheme, prepare=account.prepare_guild_for_qq_locked)
+        if task == "refresh_secret":
+            order, scheme, targets = args
+            return refresh_shop(account.client, task, cancel, order, scheme, targets,
+                                prepare=account.prepare_guild_for_qq_locked, options=options)
         account.prepare_guild_for_qq_locked()
-        runner = {"activity": activity, "abyss": abyss, "buy_batch": buy,
-                  "refresh_secret_paid": refresh_secret_paid}[task]
+        if task == "buy_shop_equipment":
+            return purchases.buy_confirmed(account.client, args)
+        if task in {"refresh_secret_paid", "refresh_star_source"}:
+            refresh = refresh_secret_paid if task == "refresh_secret_paid" else refresh_star_source
+            return refresh(account.client, args, cancel, progress, options=options)
+        runner = {"activity": activity, "abyss": abyss, "buy_batch": buy}[task]
         return runner(account.client, args, cancel, progress)

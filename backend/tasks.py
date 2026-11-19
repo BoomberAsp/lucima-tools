@@ -1675,7 +1675,7 @@ def _star_source_refresh_result(res: dict, scheme: dict) -> dict:
     }
 
 
-def star_source_query(c: GameClient) -> dict:
+def star_source_query(c: GameClient, *, include_shelf: bool = False) -> dict:
     """进入星源商店以同步跨日次数；Query 返回的历史货架不参与筛选。"""
     try:
         res = c.call(
@@ -1687,14 +1687,22 @@ def star_source_query(c: GameClient) -> dict:
             "ok": False, "error": m.msg, "refreshCount": None,
         }
     data = res.get("Data") if isinstance(res.get("Data"), dict) else res
-    return {
+    result = {
         "ok": True,
         "refreshCount": data.get("RefreshCount"),
         "revertTime": data.get("RevertTime"),
     }
+    if include_shelf:
+        result["shelf"] = _star_source_shelf(data)
+    return result
 
 
-def star_source_refresh(c: GameClient, scheme: dict) -> dict:
+def _star_source_shelf(data: dict) -> list:
+    drops = data.get("CustomEquipDropList")
+    return [drop.get("Equipment") if isinstance(drop, dict) else None for drop in drops[:3]] if isinstance(drops, list) else []
+
+
+def star_source_refresh(c: GameClient, scheme: dict, *, include_shelf: bool = False) -> dict:
     """刷新一次星源商店，并按装备过滤方案返回本轮命中的装备。"""
     try:
         res = c.call(
@@ -1707,10 +1715,14 @@ def star_source_refresh(c: GameClient, scheme: dict) -> dict:
             "refreshCount": None,
         }
 
-    return _star_source_refresh_result(res, scheme)
+    result = _star_source_refresh_result(res, scheme)
+    if include_shelf:
+        data = res.get("Data") if isinstance(res.get("Data"), dict) else res
+        result["shelf"] = _star_source_shelf(data)
+    return result
 
 
-def star_source_buy(c: GameClient, shop_index: int) -> dict:
+def star_source_buy(c: GameClient, shop_index: int, *, include_settlement: bool = False) -> dict:
     """Buy one item from the current star-source shelf by its zero-based index."""
     if isinstance(shop_index, bool) or not isinstance(shop_index, int) or not 0 <= shop_index < 3:
         return {"ok": False, "detail": "购买失败：装备位置无效"}
@@ -1739,7 +1751,10 @@ def star_source_buy(c: GameClient, shop_index: int) -> dict:
     detail = "购买成功"
     if spent:
         detail += f"，花费 {_fmt_items(spent)}"
-    return {"ok": True, "detail": detail, "shopIndex": shop_index}
+    result = {"ok": True, "detail": detail, "shopIndex": shop_index}
+    if include_settlement:
+        result.update(CostItems=response.get("CostItems"), Drop=response.get("Drop"))
+    return result
 
 
 # ============ 装备活动（定制装备） ============
