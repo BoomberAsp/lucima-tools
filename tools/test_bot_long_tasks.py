@@ -205,23 +205,18 @@ class ShopRefreshTests(unittest.TestCase):
         client.call.return_value = {"Data": {"RefreshCount": 2}}
         self.assertEqual(long.refresh_shop(client, "refresh_star_source", threading.Event(), (200, "star"))[0],
                          "quote_unavailable")
-        self.assertEqual(client.call.call_args.args[0], "CustomEquipHandler.Query")
-        client.call.assert_called_once()
+        client.call.assert_not_called()
 
-    def test_shop_match_returns_only_filtered_equipment_and_waits(self):
-        client = SimpleNamespace(account_state={})
-        scheme = {"slots": {"ring": [{"sets": ["Speed"]}]}}
-        equipment = {"shopIndex": 1, "tierName": "传说", "setCN": "速度", "slotCN": "戒指", "auxScore": 62}
-        with patch("backend.tasks.star_source_query", return_value={"ok": True, "refreshCount": 3}), patch(
-                "backend.tasks.star_source_refresh", return_value={
-                    "ok": True, "refreshCount": 4, "cards": [equipment, {"staticID": "unmatched-fixture"}],
-                    "matches": [equipment],
-                }) as refresh:
-            status, facts = long.refresh_shop(client, "refresh_star_source", threading.Event(), (1, "star"), scheme)
-        self.assertEqual(status, "shop_hit")
-        self.assertIn("第 2 档 · 传说 · 速度 · 戒指 · 62 分", facts)
-        self.assertNotIn("unmatched-fixture", str(facts))
-        refresh.assert_called_once_with(client, scheme)
+    def test_star_source_refresh_never_opens_a_session_without_verified_quote(self):
+        with patch("backend.appcore._bootstrap_and_register") as login, patch(
+            "backend.tasks.star_source_refresh",
+        ) as refresh:
+            for code in ("", "1", "200", '{"order":"1","scheme":{"slots":{}}}'):
+                with self.subTest(code=code):
+                    result = dispatch({"action": "run", "task": "refresh_star_source", "code": code})
+                    self.assertEqual(result["status"], "quote_unavailable")
+            login.assert_not_called()
+            refresh.assert_not_called()
 
     def test_secret_shop_yields_a_match_only_after_confirming_free_refresh(self):
         client = SimpleNamespace(account_state={})
@@ -236,19 +231,17 @@ class ShopRefreshTests(unittest.TestCase):
             self.assertEqual(long.refresh_shop(client, "refresh_secret", threading.Event(), (200, "free"), {"slots": {}})[0],
                              "unexpected_cost")
 
-    def test_star_source_reads_state_then_refreshes_once(self):
-        client = SimpleNamespace(_auth_data=lambda data: data, call=Mock(side_effect=[
-            {"Data": {"RefreshCount": 2}}, {"Data": {"RefreshCount": 3}},
-        ]))
-        self.assertEqual(long.refresh_shop(client, "refresh_star_source", threading.Event())[0], "ok")
-        self.assertEqual([call.args[0] for call in client.call.call_args_list], [
-            "CustomEquipHandler.Query", "CustomEquipHandler.RefreshEquip",
-        ])
+    def test_star_source_status_reads_state_without_refreshing_or_using_product_price(self):
+        from backend.bot_views import parse_view, view
 
-    def test_star_source_skips_if_refresh_count_is_unavailable(self):
-        client = SimpleNamespace(_auth_data=lambda data: data, call=Mock(return_value={"Data": {}}))
-        self.assertEqual(long.refresh_shop(client, "refresh_star_source", threading.Event())[0], "skipped")
-        client.call.assert_called_once()
+        query = {"Data": {"RefreshCount": 2, "PriceItemID": "109", "Price": 5}}
+        client = SimpleNamespace(account_state={}, _auth_data=lambda data: data, call=Mock(return_value=query))
+        account = SimpleNamespace(client=client, prepare_guild_for_qq_locked=Mock())
+        details = view(account, parse_view("star_source"))
+        self.assertIn(" 2", details[0])
+        self.assertNotIn("109", str(details))
+        account.prepare_guild_for_qq_locked.assert_called_once()
+        client.call.assert_called_once_with("CustomEquipHandler.Query", {"CommodityID": "RainbowStarSourceBox10"})
 
     def test_account_summary_excludes_raw_identity(self):
         from backend.bot_views import parse_view, view

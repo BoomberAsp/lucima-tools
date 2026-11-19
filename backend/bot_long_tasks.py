@@ -14,6 +14,7 @@ LONG_TASKS = {"activity", "abyss", "buy_batch"}
 SHOP_TASKS = {"refresh_secret", "refresh_star_source"}
 QUERIES = {"activity", "abyss"}
 MAX_SHOP_ROUNDS = 200
+STAR_SOURCE_QUOTE_UNAVAILABLE = "当前缺少可核实的星源商店刷新报价，本次未提交刷新。"
 
 
 def parse_shop(task: str, code: str):
@@ -108,13 +109,13 @@ def query(state, kind):
     return [row["id"] for row in abyss_scenes(state)[:8]] or ["暂无可选关卡"]
 
 
-def match_details(cards, position_key):
+def match_details(cards):
     """Keep the result card display-only. It never authorizes a purchase by position."""
     if not isinstance(cards, list):
         return []
     matches = []
     for card in cards:
-        if not isinstance(card, dict) or type(position := card.get(position_key)) is not int or not 0 <= position < 6:
+        if not isinstance(card, dict) or type(position := card.get("index")) is not int or not 0 <= position < 6:
             continue
         fields = [card.get(key) for key in ("tierName", "setCN", "slotCN", "staticID")]
         label = " · ".join(value[:30] for value in fields if isinstance(value, str) and value)
@@ -128,63 +129,36 @@ def match_details(cards, position_key):
 
 def refresh_shop(client, task, cancel, order=(1, "free"), scheme=None, *, prepare=None):
     from .tasks import (
-        _collect_items, _fmt_items, _record_goods_sid, item_name, secret_shop_next_free,
-        shop_reset, star_source_query, star_source_refresh,
+        _record_goods_sid, item_name, secret_shop_next_free, shop_reset,
     )
     count, mode = order
-    if task == "refresh_secret":
-        if mode != "free":
-            return "quote_unavailable", ["当前游戏数据未提供可核实的钻石刷新报价。"]
-        next_free = secret_shop_next_free(client.account_state or {})
-        if next_free is not None and next_free > time.time() * 1000:
-            return "skipped", [f"申请 {count} 次，实际刷新 0 次。免费额度仍在冷却。"]
-        if prepare is not None:
-            prepare()
-        if cancel.is_set():
-            return "cancelled", []
-        result = shop_reset(client, use_gold=False, auto_buy_sids=[], equipment_scheme=scheme)
-        if not result.get("ok") and str(result.get("error", "")).replace(" ", "").casefold() == "cantreset":
-            return "skipped", ["游戏返回免费刷新未就绪。"]
-        records = result.get("records") or []
-        details = [f"申请 {count} 次，实际刷新 1 次。新货架 {len(records)} 档。", "自动购买 0 件。"]
-        for index, record in enumerate(records[:6], 1):
-            sid = _record_goods_sid(record)
-            details.append(f"第 {index} 档 · {item_name(str(sid)) if sid else '装备'}")
-        if result.get("costItems"):
-            return "unexpected_cost", details
-        if records and result.get("ok"):
-            matches = match_details(result.get("legendaryMatches"), "index") if scheme else []
-            if matches:
-                return "shop_hit", [details[0], f"命中 {len(matches)} 件 · 自动购买 0 件。", *matches]
-            return "ok", details
-        return "unconfirmed", ["游戏未返回可确认的秘密商店新货架。"]
-
+    if task == "refresh_star_source":
+        return "quote_unavailable", [STAR_SOURCE_QUOTE_UNAVAILABLE]
+    if mode != "free":
+        return "quote_unavailable", ["当前游戏数据未提供可核实的钻石刷新报价。"]
+    next_free = secret_shop_next_free(client.account_state or {})
+    if next_free is not None and next_free > time.time() * 1000:
+        return "skipped", [f"申请 {count} 次，实际刷新 0 次。免费额度仍在冷却。"]
     if prepare is not None:
         prepare()
-    initial = star_source_query(client)
-    before = initial.get("refreshCount")
-    if not initial.get("ok") or type(before) is not int or before < 0:
-        return "skipped", ["星源商店的刷新状态不可用，未提交刷新。"]
-    if count > 1:
-        return "quote_unavailable", [f"申请 {count} 次。游戏状态接口未提供可核实的批量刷新报价。"]
     if cancel.is_set():
         return "cancelled", []
-    result = star_source_refresh(client, scheme or {})
-    after = result.get("refreshCount")
-    if not result.get("ok") or type(after) is not int or after == before:
-        return "unconfirmed", ["游戏未返回可确认的星源商店新刷新计数。"]
-    cards = result.get("cards") or []
-    details = [f"刷新计数 {before} → {after}，返回 {len(cards)} 件装备，自动购买 0 件。"]
-    spent = {}
-    _collect_items(result.get("costItems"), spent)
-    if spent:
-        details.append(f"游戏返回扣款 {_fmt_items(spent)}")
-    matches = match_details(result.get("matches"), "shopIndex") if scheme else []
-    if matches:
-        return "shop_hit", [*details, f"命中 {len(matches)} 件装备。", *matches]
-    for card in cards[:3]:
-        details.append(" · ".join(str(card.get(key) or "") for key in ("tierName", "setCN", "slotCN", "staticID")))
-    return "ok", details
+    result = shop_reset(client, use_gold=False, auto_buy_sids=[], equipment_scheme=scheme)
+    if not result.get("ok") and str(result.get("error", "")).replace(" ", "").casefold() == "cantreset":
+        return "skipped", ["游戏返回免费刷新未就绪。"]
+    records = result.get("records") or []
+    details = [f"申请 {count} 次，实际刷新 1 次。新货架 {len(records)} 档。", "自动购买 0 件。"]
+    for index, record in enumerate(records[:6], 1):
+        sid = _record_goods_sid(record)
+        details.append(f"第 {index} 档 · {item_name(str(sid)) if sid else '装备'}")
+    if result.get("costItems"):
+        return "unexpected_cost", details
+    if records and result.get("ok"):
+        matches = match_details(result.get("legendaryMatches")) if scheme else []
+        if matches:
+            return "shop_hit", [details[0], f"命中 {len(matches)} 件 · 自动购买 0 件。", *matches]
+        return "ok", details
+    return "unconfirmed", ["游戏未返回可确认的秘密商店新货架。"]
 
 
 def buy(client, picks, cancel, progress):

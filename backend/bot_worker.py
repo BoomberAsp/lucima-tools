@@ -183,6 +183,8 @@ def dispatch(request: dict, *, cancel=None, progress=None) -> dict:
         args = bot_long_tasks.parse_shop_request(task, code)
         if args is None:
             return {"status": "invalid"}
+        if task == "refresh_star_source":
+            return {"status": "quote_unavailable", "details": [bot_long_tasks.STAR_SOURCE_QUOTE_UNAVAILABLE]}
     elif task in bot_long_tasks.LONG_TASKS or task == "long_info":
         args = code if task == "long_info" and code in bot_long_tasks.QUERIES else bot_long_tasks.parse(task, code)
         if args is None:

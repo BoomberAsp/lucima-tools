@@ -92,7 +92,7 @@ class PhaseTwoTests(unittest.TestCase):
         self.enterContext(patch.object(config, "load_accounts", return_value={}))
         cases = (("reactor", ""), ("potion", ""), ("starforce", ""), ("friend_support", ""),
                  ("tesseract", ""), ("sweep_illusion", "1"), ("account_view", "equip_event"),
-                 ("refresh_secret", "1 free"), ("refresh_star_source", "1"), ("buy_batch", "FriendShip3:1:24:100"))
+                 ("refresh_secret", "1 free"), ("account_view", "star_source"), ("buy_batch", "FriendShip3:1:24:100"))
         for task, code in cases:
             with self.subTest(task=task):
                 client = GameClient("")
@@ -148,8 +148,6 @@ class PhaseTwoTests(unittest.TestCase):
                     "CostItems": [{"Item": {"StaticID": "24", "Count": 100}}]}
         if route == "CustomEquipHandler.Query":
             return {"RefreshCount": 1}
-        if route == "CustomEquipHandler.RefreshEquip":
-            return {"RefreshCount": 2}
         if route.endswith("PurityScene"):
             return {"CostItems": [{"Item": {"StaticID": "39", "Count": 1}}]}
         return {}

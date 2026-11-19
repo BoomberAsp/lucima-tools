@@ -9,7 +9,7 @@ from .runtime_data import pinned
 
 
 VIEWS = {"summary", "resources", "heroes", "items", "teams", "guild", "weekly", "guild_shop",
-         "abyss_sweep", "arena", "vote", "equip_event", "guild_aid", "guild_captain"}
+         "abyss_sweep", "arena", "vote", "equip_event", "guild_aid", "guild_captain", "star_source"}
 VIEW_RE = re.compile(r"([a-z_]+)(?: ([1-9][0-9]{0,2})(?: ([^\x00-\x1f]{1,32}))?)?")
 GUILD_ORDER = re.compile(r"([A-Za-z0-9_]{1,32}) ([1-9]|10) (29|30) ([1-9][0-9]{0,6})")
 PAGE_SIZE = 5
@@ -57,6 +57,14 @@ def view(account, args):
             return ["游戏暂未提供当前装备活动状态。"]
         return [f"当前 {result['setCN'] or '未选套装'} · {result['slotCN'] or '未选部位'}",
                 "有待选副属性。" if result.get("hasCandidate") else "当前没有待选副属性。"]
+    if name == "star_source":
+        from .tasks import star_source_query
+
+        account.prepare_guild_for_qq_locked()
+        result = star_source_query(client)
+        count = result.get("refreshCount")
+        count_text = str(count) if result.get("ok") and type(count) is int and count >= 0 else "未能同步"
+        return [f"星源商店刷新计数 {count_text}。", "暂无可核实的刷新报价，QQ 刷新暂不可用。"]
     if name == "abyss_sweep":
         from .tasks import abyss_progress
 
