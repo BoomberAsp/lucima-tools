@@ -8,12 +8,115 @@ from unittest.mock import Mock, patch
 import httpx
 
 from backend import accounts, appcore, config
+from backend.bot_views import account_profile, run_account_action, view
 from backend.bot_worker import dispatch, phase_two
 from backend.game_client import GameClient, GameError
 from backend.tasks import task_dispatch
 
 
 class PhaseTwoTests(unittest.TestCase):
+    def test_profile_projects_snapshot_and_hides_group_details(self):
+        state = {
+            "Info": {"Name": "样例\n团长", "CUID": 123456789, "LV": 70, "LeaderSID": "H001",
+                     "_id": "hidden-database-id", "LoginTime": 1},
+            "ItemContainer": {"Items": [
+                {"StaticID": "3", "Count": 317, "TimeCollect": {"MaxCount": 296}},
+                {"StaticID": "4", "Count": 0, "TimeCollect": {"MaxCount": 5}},
+                {"StaticID": "2", "Count": 1340},
+                {"StaticID": "39", "Count": 5},
+            ]},
+            "RoleDataContainer": {"Roles": [
+                {"StaticID": f"H00{number}", "LV": 60, "Star": number, "ImprintLV": 7} for number in range(1, 7)
+            ]},
+        }
+        summary = account_profile(state, full=False)
+        full = account_profile(state, full=True)
+        self.assertEqual(summary["name"], "样例 团长")
+        self.assertEqual(summary["stamina"], {"current": 317, "max": 296})
+        self.assertEqual(summary["heroes_total"], 6)
+        self.assertEqual(summary["items_total"], 1)
+        self.assertTrue({"uid", "currencies", "heroes"}.isdisjoint(summary))
+        self.assertEqual(full["uid"], "123456789")
+        self.assertEqual(full["currencies"]["diamond"], 1340)
+        self.assertEqual(len(full["heroes"]), 5)
+        self.assertEqual(full["heroes"][0]["grade"], "SSS")
+        self.assertNotIn("hidden-database-id", str(full))
+
+    def test_partial_profile_never_reports_absent_resources_as_zero(self):
+        full = account_profile({"Info": {"LV": 1}}, full=True)
+        self.assertNotIn("stamina", full)
+        self.assertNotIn("currencies", full)
+        self.assertIsNone(full["heroes_total"])
+        self.assertIsNone(account_profile({}, full=False))
+
+    def test_illusion_quote_is_only_available_for_a_cleared_floor_and_positive_balance(self):
+        for floor, count, expected in ((79, 3, {}), (80, 0, {}), (80, 3, {"floor": 80, "count": 3})):
+            with self.subTest(floor=floor, count=count):
+                state = self.illusion_state(floor, count)
+                account = SimpleNamespace(client=SimpleNamespace(account_state=state, call=Mock()))
+                quote = {}
+                view(account, ("abyss_sweep", 1, ""), illusion_quote=quote)
+                self.assertEqual(quote, expected)
+                account.client.call.assert_not_called()
+
+    def test_illusion_sweep_rechecks_exact_quote_after_account_preflight(self):
+        for fresh_floor, fresh_count in ((80, 4), (81, 3), (80, 2)):
+            with self.subTest(floor=fresh_floor, count=fresh_count):
+                client = SimpleNamespace(account_state=self.illusion_state(80, 3), call=Mock())
+                account = SimpleNamespace(client=client, prepare_guild_for_qq_locked=Mock(
+                    side_effect=lambda: setattr(client, "account_state", self.illusion_state(fresh_floor, fresh_count)),
+                ))
+                status, details = run_account_action(account, "sweep_illusion", (3, 80))
+                self.assertEqual(status, "skipped")
+                self.assertIn("已变化", details[0])
+                client.call.assert_not_called()
+
+    def test_illusion_sweep_only_confirms_a_matching_synchronizer_debit(self):
+        def cost(item, amount):
+            return {"Item": {"StaticID": item, "Count": amount}}
+
+        for receipt_costs, expected in (
+                ([cost("39", 3)], "ok"), ([cost("39", 4)], "unexpected_cost"),
+                ([cost("39", 3), cost("3", 1)], "unexpected_cost"), ([], "unconfirmed")):
+            with self.subTest(costs=receipt_costs):
+                client = SimpleNamespace(account_state=self.illusion_state(80, 3), _auth_data=lambda data: data,
+                                         call=Mock(return_value={"CostItems": receipt_costs}))
+                account = SimpleNamespace(client=client, prepare_guild_for_qq_locked=Mock())
+                status, details = run_account_action(account, "sweep_illusion", (3, 80))
+                self.assertEqual(status, expected)
+                client.call.assert_called_once()
+                if expected == "ok":
+                    self.assertIn("本次体力消耗 0。", details)
+
+    @staticmethod
+    def illusion_state(floor, count):
+        return {"SceneDataContainer": {"Scenes": [{"StaticID": f"Abyss_{floor}", "Stars": [1]}]},
+                "ItemContainer": {"Items": [{"StaticID": "39", "Count": count}]}}
+
+    def test_stage_quote_reads_exact_scene_price_and_leaves_missing_price_unknown(self):
+        state = {"SceneDataContainer": {"Scenes": [
+            {"StaticID": "HuntFire_14", "Stars": [1]},
+            {"StaticID": "HuntFire_13", "Stars": [1]},
+            {"StaticID": "HuntFire_12", "Stars": [0]},
+            {"StaticID": "ElfIce_4", "Stars": [1]},
+        ]}, "ItemContainer": {"Items": [{"StaticID": "3", "Count": 60}]}}
+        catalog = {"version": "fixture", "tables": {"Scene": {
+            "HuntFire_14": {"Energy": "27"}, "HuntFire_12": {"Energy": "18"},
+            "ElfIce_4": {"Energy": "12"},
+        }}}
+        client = SimpleNamespace(account_state=state, call=Mock())
+        account = SimpleNamespace(client=client, lock=threading.Lock(),
+                                  _request_scope=nullcontext, require_current_day=Mock())
+        with patch("backend.bot_sweep_quotes.metadata", return_value=catalog):
+            status, hunt = phase_two(account, "stages", "hunt 火")
+            _, elf = phase_two(account, "stages", "elf ElfIce_4")
+        self.assertEqual(status, "ok")
+        self.assertIn("27 体力 · 按体力最多 2 次", hunt[2])
+        self.assertIn("扫荡体力未收录", hunt[3])
+        self.assertTrue(hunt[4].endswith("未通关"))
+        self.assertIn("12 体力 · 按体力最多 5 次", elf[2])
+        client.call.assert_not_called()
+
     def test_restore_validates_the_account_from_portal(self):
         saved = {"user_id": "test-owner", "refresh_token": "dummy-refresh"}
         with patch("backend.portal.portal_refresh_v2", return_value={**saved, "access_token": "dummy-access"}) as refresh:

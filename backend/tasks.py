@@ -766,8 +766,8 @@ def _collect_items(items: list, counter: dict):
             counter[sid] = counter.get(sid, 0) + cnt
 
 
-# 动力转换领取的最短累积阈值：达到即视为满 100%
-REACTOR_FULL_HOURS = 12
+# 动力转换两次领取之间的最短间隔（小时）。
+REACTOR_MIN_CLAIM_HOURS = 1
 
 
 def _ms(v):
@@ -778,22 +778,22 @@ def _ms(v):
 
 
 def task_reactor(c: GameClient) -> dict:
-    """动力转换（ArkReactor）：距上次领取满 12 小时才领，避免频繁领取降低收益。"""
+    """动力转换（ArkReactor）：达到最短领取间隔后尝试领取。"""
     reactor = (c.account_state or {}).get("ArkReactorData", {}) or {}
     last_ms = _ms(reactor.get("LastMoneyReceivedTime"))
     now_ms = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
 
     if last_ms is not None:
         elapsed_h = (now_ms - last_ms) / 3600_000
-        if elapsed_h < REACTOR_FULL_HOURS:
-            remain = REACTOR_FULL_HOURS - elapsed_h
+        if elapsed_h < REACTOR_MIN_CLAIM_HOURS:
+            remain = REACTOR_MIN_CLAIM_HOURS - elapsed_h
             h = int(remain)
             m = int((remain - h) * 60)
             return {
                 "ok": True,
                 "skipped": True,
-                "lines": [f"未满 100%（距上次领取 {elapsed_h:.1f}h），还需约 {h} 小时 {m} 分，跳过"],
-                "detail": f"动力转换未满，还需约 {h}h{m}m",
+                "lines": [f"领取间隔未到（距上次领取 {elapsed_h:.1f}h），还需约 {h} 小时 {m} 分，跳过"],
+                "detail": f"动力转换领取间隔未到，还需约 {h}h{m}m",
             }
 
     try:
@@ -3803,7 +3803,7 @@ TASKS: dict[str, dict] = {
         "fn": task_send_meal, "kind": "toggle", "wantsRuntime": True,
     },
     "reactor": {
-        "name": "动力转换", "desc": "基地 · 动力转换（满 12 小时才领取）",
+        "name": "动力转换", "desc": f"基地 · 动力转换（每次领取至少间隔 {REACTOR_MIN_CLAIM_HOURS} 小时）",
         "fn": task_reactor, "kind": "toggle",
     },
     "sf_potion": {
@@ -4006,7 +4006,7 @@ def next_claim_times(state: dict, params: dict | None = None, *,
     与任务内部的到点判断同源，所以展示与实际巡检行为一致。
       - month_signin: 每次成功登录后一次，成功后等待下一次登录或每日快照刷新
       - send_meal: 账号快照刷新后 / 晚间 20:01，runtime 带账号刷新档期与邮件确认状态
-      - reactor: 上次领取 + 12h
+      - reactor: 上次领取 + 最短领取间隔
       - 基地生产中心三项: 各自 NextCanReceive*Time
       - dispatch: 最早一个未完成派遣的 FinishTime（全空/全完成则视为可领/无）
       - shop_free: 货架 LastResetTime + 1h1s，缺少时间戳时返回 None + ready=True
@@ -4048,10 +4048,10 @@ def next_claim_times(state: dict, params: dict | None = None, *,
     def entry(next_ms):
         return {"nextMs": next_ms, "ready": (next_ms is None or now_ms >= next_ms)}
 
-    # 动力转换：上次领取 + 12h
+    # 动力转换：上次领取 + 最短领取间隔
     reactor = state.get("ArkReactorData", {}) or {}
     last_ms = _ms(reactor.get("LastMoneyReceivedTime"))
-    out["reactor"] = entry((last_ms + REACTOR_FULL_HOURS * 3600_000) if last_ms is not None else None)
+    out["reactor"] = entry((last_ms + REACTOR_MIN_CLAIM_HOURS * 3600_000) if last_ms is not None else None)
 
     # 基地生产中心三项
     lab = state.get("ArkStarForceLabData", {}) or {}

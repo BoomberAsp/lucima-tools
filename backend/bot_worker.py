@@ -32,11 +32,11 @@ DONATION_CAPS = {"gold": 5000, "courage": 1}
 
 def phase_two(account, task: str, arg: str) -> tuple[str, list[str]]:
     """Return only bounded, selected receipt fields from the authenticated snapshot."""
+    from .bot_sweep_quotes import stage_details
     from .guild import GUILD_DONATIONS, GuildService, has_guild
     from .guild_quests import GuildWeeklyService
     from .tasks import (
-        _summon_record, element_sweep_scenes, hunt_sweep_scenes, list_teams, parse_equipment,
-        task_free_summon,
+        _summon_record, parse_equipment, task_free_summon,
     )
 
     client = account.client
@@ -44,10 +44,7 @@ def phase_two(account, task: str, arg: str) -> tuple[str, list[str]]:
     with account.lock, account._request_scope():
         account.require_current_day()
         if task == "stages":
-            scenes = (element_sweep_scenes if arg == "elf" else hunt_sweep_scenes)(state)
-            teams = list_teams(client)
-            return "ok", [f"已解锁关卡 {len(scenes)} 个，队伍 {len(teams)} 支",
-                          *[row["id"] for row in scenes[:6]]]
+            return "ok", stage_details(client, state, arg)
         if task == "equipment":
             query = arg.casefold()
             matches = []
@@ -114,6 +111,7 @@ def exit_with_bridge(parent_pid: int) -> None:
 def dispatch(request: dict, *, cancel=None, progress=None) -> dict:
     from . import accounts, appcore
     from . import bot_long_tasks, bot_views
+    from .bot_sweep_quotes import STAGE_QUERY
     from .game_client import DuplicateLoginError, GameMessage, MaintenanceError, TaskDeferred, is_duplicate_login_message
     from .maintenance import service as maintenance
     from .portal import (
@@ -150,7 +148,7 @@ def dispatch(request: dict, *, cancel=None, progress=None) -> dict:
             or not isinstance(code, str) or len(code) > (2400 if task in bot_long_tasks.SHOP_TASKS | {"filter_preview", "refresh_secret_paid"} else 255)
             or (task == "redeem" and not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", code))
             or (task == "donate" and code not in DONATION_CAPS)
-            or (task == "stages" and code not in {"hunt", "elf"})
+            or (task == "stages" and not STAGE_QUERY.fullmatch(code))
             or (task == "equipment" and len(code) > 24)
             or (task in TASKS.keys() - {"redeem"} and code)):
         return {"status": "invalid"}
@@ -165,9 +163,11 @@ def dispatch(request: dict, *, cancel=None, progress=None) -> dict:
             return {"status": "invalid"}
         args = match.groups()
     elif task == "sweep_illusion":
-        if not re.fullmatch(r"[1-9][0-9]{0,2}", code):
+        match = bot_views.ILLUSION_SWEEP_ORDER.fullmatch(code)
+        if not match:
             return {"status": "invalid"}
-        args = int(code)
+        cap, floor = match.groups()
+        args = int(cap), int(floor) if floor else None
     elif task == "filter_preview":
         try:
             args = json.loads(code)
@@ -200,8 +200,12 @@ def dispatch(request: dict, *, cancel=None, progress=None) -> dict:
         args = bot_long_tasks.purchases.confirmed_order(code)
         if args is None:
             return {"status": "invalid"}
-    elif task in bot_long_tasks.LONG_TASKS or task == "long_info":
-        args = code if task == "long_info" and code in bot_long_tasks.QUERIES else bot_long_tasks.parse(task, code)
+    elif task == "long_info":
+        if not bot_long_tasks.is_query(code):
+            return {"status": "invalid"}
+        args = code
+    elif task in bot_long_tasks.LONG_TASKS:
+        args = bot_long_tasks.parse(task, code)
         if args is None:
             return {"status": "invalid"}
     auth = request["auth"]
@@ -230,7 +234,17 @@ def dispatch(request: dict, *, cancel=None, progress=None) -> dict:
                 return {"status": status, "auth": auth, "details": details}
             if task == "account_view":
                 with account.lock, account._request_scope():
-                    return {"status": "ok", "auth": auth, "details": bot_views.view(account, args)}
+                    if args[0] in {"profile", "profile_full"}:
+                        card = bot_views.account_profile(account.client.account_state or {}, full=args[0] == "profile_full")
+                        if card is None:
+                            return {"status": "not_started", "auth": auth}
+                        return {"status": "ok", "auth": auth, "accountProfile": card}
+                    quote = {}
+                    details = bot_views.view(account, args, illusion_quote=quote)
+                    result = {"status": "ok", "auth": auth, "details": details}
+                    if quote:
+                        result["illusionQuote"] = quote
+                    return result
             if task == "filter_preview":
                 with account.lock, account._request_scope():
                     details = bot_views.filter_preview(account.client.account_state or {}, args)
@@ -245,6 +259,8 @@ def dispatch(request: dict, *, cancel=None, progress=None) -> dict:
                 result = {"status": status, "auth": auth, "details": details}
                 if status == "shop_hit" and options:
                     result["shopOptions"] = options
+                elif task == "long_info" and status == "ok" and options:
+                    result["battleOptions"] = options
                 return result
             if task in PHASE_TWO:
                 status, details = phase_two(account, task, code)

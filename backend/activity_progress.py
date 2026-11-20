@@ -28,6 +28,10 @@ def records(state: dict) -> dict:
             if isinstance(row, dict) and row.get("StaticID")}
 
 
+def ready_to_start(stage: dict, saved: dict) -> bool:
+    return not stage["cleared"] and (not stage["preScene"] or cleared(saved.get(stage["preScene"])))
+
+
 def scenes(state: dict, family: str = "", *, now=None) -> list[dict]:
     """All currently open stages, including stages never present in a login."""
     from .tasks import _activity_names, _localized_text, _ACTIVITY_TIERS
@@ -50,6 +54,8 @@ def scenes(state: dict, family: str = "", *, now=None) -> list[dict]:
         result.append({"id": sid, "family": match[1], "chapter": chapter, "stage": stage,
                        "name": title, "activityName": _activity_names().get(match[1], match[1]),
                        "cleared": cleared(saved.get(sid)), "energy": int(scene.get("Energy") or 0),
+                       "energyKnown": scene.get("Energy") not in (None, ""),
+                       "extraEntryCost": bool(scene.get("EnterCost")),
                        "storyTeam": bool(scene.get("MyCampTeam")), "serverBattle": enabled(scene.get("ServerBattle")),
                        "preScene": scene.get("PreScene", "")})
     return sorted(result, key=lambda row: (row["family"], row["chapter"], row["stage"]))
@@ -187,22 +193,23 @@ def run(client, family: str, team_id: str, support_entry=None, *, cancel_event, 
             return result(False, "自动推关已停止")
         live = scenes(state, family)
         if not live:
-            return result(False, "活动已结束，自动推关已停止")
+            return result(False, "活动已结束，自动推关已停止", stop_reason="activity_closed")
         todo = [stage for stage in live if not stage["cleared"]]
         if not todo:
             return result(True, "当前已开放关卡全部通关")
         saved = records(state)
-        stage = next((s for s in todo if (server_limits is None or s["serverBattle"])
-                      and (not s["preScene"] or cleared(saved.get(s["preScene"])))), None)
+        stage = next((s for s in todo if (server_limits is None or s["serverBattle"]) and ready_to_start(s, saved)), None)
         if stage is None:
             return result(False, "没有满足前置条件的服务端战斗关卡" if server_limits is not None
-                          else "剩余关卡的前置条件尚未满足")
+                          else "剩余关卡的前置条件尚未满足", stop_reason="prerequisite")
         if server_limits is not None:
             count_limit, energy_limit = server_limits
             if len(completed) >= count_limit:
                 return result(True, "已达到本次关卡上限")
-            if stage["energy"] < 0 or energy_used + stage["energy"] > energy_limit:
-                return result(False, "下一关会超过体力预算，已停止")
+            if stage.get("energyKnown") is False or stage["energy"] < 0:
+                return result(False, "下一关的体力标价待核实", stop_reason="energy_unknown")
+            if energy_used + stage["energy"] > energy_limit:
+                return result(False, "下一关会超过体力预算，已停止", stop_reason="energy_budget")
         current = stage["id"]
         try:
             scene = validate_scene(current)
@@ -212,11 +219,14 @@ def run(client, family: str, team_id: str, support_entry=None, *, cancel_event, 
             return result(False, "关卡配置未通过检查", stop_reason="scene_validation")
         items = {item.get("StaticID"): item for item in state.get("ItemContainer", {}).get("Items", [])}
         energy = items.get("3")  # CURRENCY_IDS.stamina
-        if ((energy is not None and int(energy.get("Count") or 0) < stage["energy"])
-                or (server_limits is not None and energy is None and stage["energy"] > 0)):
-            return result(False, "体力不足，自动推关已停止")
+        if server_limits is not None and stage["energy"] > 0:
+            count = (energy or {}).get("Count")
+            if type(count) is not int or count < 0:
+                return result(False, "无法核对当前体力", stop_reason="stamina_unknown")
+        if energy is not None and int(energy.get("Count") or 0) < stage["energy"]:
+            return result(False, "体力不足，自动推关已停止", stop_reason="stamina")
         if scene.get("EnterCost"):
-            return result(False, "此关卡有额外入场消耗，暂不支持自动推关")
+            return result(False, "此关卡有额外入场消耗，暂不支持自动推关", stop_reason="extra_cost")
         try:
             info = start_info(state, current, team_id, support)
         except (GameError, AttributeError, KeyError, TypeError, ValueError):

@@ -40,7 +40,7 @@ from .tasks import (
 
 # 调度参数。
 # **不再是固定 5 分钟盲扫**：绝大多数 toggle 任务都有服务器下发的精确档期
-# （reactor=上次领+12h / 生产中心三项=NextCanReceive*Time / dispatch=FinishTime /
+# （reactor=上次领取+最短领取间隔 / 生产中心三项=NextCanReceive*Time / dispatch=FinishTime /
 #  shop_free=LastResetTime+1h1s / 竞技场=各 NPC 的 nextMs|retryMs），
 # 所以调度线程改成"睡到最早那个到点时刻"，并在用户改开关/改勾选时**立刻唤醒**。
 # 只有 abyss_sweep / free_summon 拿不到服务器下发的下次时刻。它们依赖每日重置后的

@@ -104,6 +104,20 @@ class GameMetadataTests(unittest.TestCase):
         self.assertEqual(scene["MyCampTeam"]["Ms"][0]["M"], "H105")
         self.assertEqual(scene["RoleStatusInfo1"]["Conditions"][0]["Value1"], 0)
 
+    def test_sweep_prices_follow_scene_rows_instead_of_fixed_floors(self):
+        self.write_table("Scene", TABLE_FIELDS["Scene"], [
+            {"ID": "HuntFire_14", "Energy": "27", "WaveInfoJsonString": "unused"},
+            {"ID": "ElfIce_4", "Energy": "12", "EnterCost": "extra"},
+            {"ID": "HuntEarth_3", "Energy": ""},
+            {"ID": "Story_1", "Energy": "8"},
+        ])
+        self.write_evidence()
+        outputs, _ = metadata.build_metadata(self.source, previous_root=self.previous)
+        scenes = outputs[metadata.BATTLE_PATH]["tables"]["Scene"]
+        self.assertEqual(scenes, {"HuntFire_14": {"Energy": "27"},
+                                  "ElfIce_4": {"Energy": "12", "EnterCost": "extra"},
+                                  "HuntEarth_3": {}})
+
     def test_shared_config_refreshes_from_source_and_rejects_missing_parameters(self):
         self.write_table("PublicVariable", TABLE_FIELDS["PublicVariable"], [{"ID": "GuildWarLessLV", "VALUE": "7"}])
         self.write_evidence()

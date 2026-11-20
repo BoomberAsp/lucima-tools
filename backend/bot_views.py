@@ -3,15 +3,17 @@ from __future__ import annotations
 
 import re
 import time
+import unicodedata
 from datetime import datetime, timedelta, timezone
 
 from .runtime_data import pinned
 
 
-VIEWS = {"summary", "resources", "heroes", "items", "teams", "guild", "weekly", "guild_shop",
+VIEWS = {"summary", "profile", "profile_full", "resources", "heroes", "items", "teams", "guild", "weekly", "guild_shop",
          "abyss_sweep", "arena", "vote", "equip_event", "guild_aid", "guild_captain", "star_source"}
 VIEW_RE = re.compile(r"([a-z_]+)(?: ([1-9][0-9]{0,2})(?: ([^\x00-\x1f]{1,32}))?)?")
 GUILD_ORDER = re.compile(r"([A-Za-z0-9_]{1,32}) ([1-9]|10) (29|30) ([1-9][0-9]{0,6})")
+ILLUSION_SWEEP_ORDER = re.compile(r"([1-9][0-9]{0,2})(?: ([1-9][0-9]{0,3}))?")
 PAGE_SIZE = 5
 
 
@@ -25,8 +27,72 @@ def parse_view(code: str):
     return name, int(page or 1), (query or "").strip().casefold()
 
 
+def stamina_count(state: dict) -> int | None:
+    from .appcore import CURRENCY_IDS
+
+    items = (state.get("ItemContainer") or {}).get("Items") or []
+    for item in items:
+        if isinstance(item, dict) and item.get("StaticID") == CURRENCY_IDS["stamina"]:
+            count = item.get("Count")
+            if type(count) is int and count >= 0:
+                return count
+    return None
+
+
+def stamina_detail(count: int | None) -> str:
+    return "账号快照体力未同步" if count is None else f"账号快照体力 {count}"
+
+
+def profile_text(value, limit: int) -> str:
+    if not isinstance(value, str):
+        return ""
+    return " ".join("".join(" " if unicodedata.category(char).startswith("C") else char
+                            for char in value[:limit * 2]).split())[:limit]
+
+
 @pinned
-def view(account, args):
+def account_profile(state: dict, *, full: bool) -> dict | None:
+    from .appcore import CURRENCY_IDS, _roster, summarize
+
+    def count(value):
+        return value if type(value) is int and value >= 0 else None
+
+    def avatar(value):
+        return value.removeprefix("/assets/avatars/") if isinstance(value, str) else ""
+
+    info = state.get("Info")
+    if not isinstance(info, dict) or not info:
+        return None
+    roles = (state.get("RoleDataContainer") or {}).get("Roles")
+    items = (state.get("ItemContainer") or {}).get("Items")
+    snapshot = {**state, "RoleDataContainer": {"Roles": roles if isinstance(roles, list) else []},
+                "ItemContainer": {"Items": items if isinstance(items, list) else []}}
+    summary = summarize(snapshot)
+    roster = _roster(snapshot)
+    item_ids = {str(item.get("StaticID")) for item in snapshot["ItemContainer"]["Items"]}
+    profile = {"name": profile_text(summary["name"], 40), "level": count(summary["level"]),
+               "avatar": avatar(summary["avatar"]), "sampled_at": int(time.time()),
+               "heroes_total": len(roster["heroes"]) if isinstance(roles, list) else None,
+               "items_total": len(roster["items"]) if isinstance(items, list) else None}
+    for key in ("stamina", "flag"):
+        if CURRENCY_IDS[key] in item_ids:
+            profile[key] = {field: count(summary[key][field]) for field in ("current", "max")}
+    if full:
+        uid = summary["cuid"]
+        if type(uid) in (int, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,32}", str(uid)):
+            profile["uid"] = str(uid)
+        if isinstance(items, list):
+            profile["currencies"] = {key: count(value) for key, value in summary["currencies"].items()}
+        profile["heroes"] = [
+            {"name": profile_text(row["name"], 28), "level": count(row["level"]),
+             "grade": row["grade"], "avatar": avatar(row["avatar"])}
+            for row in roster["heroes"][:5]
+        ]
+    return profile
+
+
+@pinned
+def view(account, args, *, illusion_quote=None):
     from .appcore import _roster, summarize
     from .guild import GuildService, has_guild
     from .guild_quests import GuildWeeklyService
@@ -66,10 +132,21 @@ def view(account, args):
         count_text = str(count) if result.get("ok") and type(count) is int and count >= 0 else "未能同步"
         return [f"星源商店刷新计数 {count_text}。"]
     if name == "abyss_sweep":
-        from .tasks import abyss_progress
+        from .tasks import ABYSS_MIN_FLOOR, abyss_progress
 
         progress = abyss_progress(state)
-        return [f"虚拟幻境最高通关 {progress['floor']} 层，当前意识同步器 {progress['sync']} 个。"]
+        floor, count = progress["floor"], progress["sync"]
+        details = [f"虚拟幻境最高通关 {floor} 层，当前意识同步器 {count} 个。"]
+        if floor < ABYSS_MIN_FLOOR:
+            details.append(f"QQ 扫荡需先通关第 {ABYSS_MIN_FLOOR} 层。")
+        elif count <= 0:
+            details.append("当前没有可消耗的意识同步器。")
+        else:
+            details.append("快速扫荡使用全部意识同步器，体力消耗 0。")
+            code = f"{count} {floor}"
+            if illusion_quote is not None and ILLUSION_SWEEP_ORDER.fullmatch(code):
+                illusion_quote.update(floor=floor, count=count)
+        return details
     if name in {"summary", "resources"}:
         status = summarize(state)
         level = status.get("level")
@@ -128,7 +205,7 @@ def view(account, args):
             roles = "、".join(f"{pos + 1}号位 {label}" for pos, label in positions[:4])
             rows.append((team["id"], team["name"], f"ID {team['id']}  {roles}".strip()))
     else:
-        rows = [(row["id"], row["name"], f"等级 {row['level']}" if name == "heroes" else f"× {row['count']}")
+        rows = [(row["id"], row["name"], f"ID {row['id']} · 等级 {row['level']}" if name == "heroes" else f"× {row['count']}")
                 for row in _roster(state)[name]]
     matches = [row for row in rows if not query or any(query in str(value).casefold() for value in row[:2])]
     pages = max(1, (len(matches) + PAGE_SIZE - 1) // PAGE_SIZE)
@@ -162,7 +239,7 @@ def filter_preview(state, scheme):
 
 def run_account_action(account, task, args):
     from .game_client import GameError
-    from .tasks import _claim_tesseract, _collect_items, _item_count, _oid, abyss_progress, task_abyss_sweep
+    from .tasks import _claim_tesseract, _collect_items, _item_count, _oid
 
     client = account.client
     state = client.account_state or {}
@@ -171,23 +248,28 @@ def run_account_action(account, task, args):
         result = _claim_tesseract(client)
         return ("skipped" if result.get("skipped") else "ok" if result.get("ok") else "unconfirmed"), []
     if task == "sweep_illusion":
-        progress = abyss_progress(state)
-        if progress["sync"] > args:
-            return "skipped", [f"持有 {progress['sync']} 个意识同步器，超过确认上限 {args}。"]
+        from .bot_shop_purchase import costs
+        from .tasks import SYNC_ITEM_SID, abyss_progress, task_abyss_sweep
+
+        cap, floor = args
         account.prepare_guild_for_qq_locked()
+        progress = abyss_progress(client.account_state or {})
+        if floor is not None and (progress["floor"] != floor or progress["sync"] != cap):
+            return "skipped", ["最高通关楼层或意识同步器数量已变化，请重新发送 /lucima 幻境扫荡。"]
+        if progress["sync"] > cap:
+            return "skipped", [f"持有 {progress['sync']} 个意识同步器，超过确认上限 {cap}。"]
         result = task_abyss_sweep(client)
         if not result.get("ok"):
-            return "unconfirmed", []
+            return "unconfirmed", ["游戏未确认本次扫荡，请先刷新幻境状态。"]
         if result.get("skipped"):
             return "skipped", result.get("lines", [])
-        costs = {}
         response = result.get("raw") or {}
-        _collect_items(response.get("CostItems"), costs)
-        if any(str(key) != "39" for key in costs) or sum(costs.values()) > args:
-            return "unexpected_cost", []
-        if costs.get("39") != progress["sync"]:
-            return "unconfirmed", ["未能核对意识同步器扣款。"]
-        return "ok", result.get("lines", [])
+        spent = costs(response.get("CostItems"))
+        if spent and (set(spent) != {SYNC_ITEM_SID} or spent[SYNC_ITEM_SID] > cap):
+            return "unexpected_cost", ["游戏回执的扣费超出确认范围。"]
+        if spent != {SYNC_ITEM_SID: progress["sync"]}:
+            return "unconfirmed", ["未能核对意识同步器扣款，请先刷新幻境状态。"]
+        return "ok", [*result.get("lines", []), "本次体力消耗 0。"]
 
     from .guild import GuildService, has_guild
     from .guild_store import GuildStoreService

@@ -14,7 +14,6 @@ from .runtime_data import pinned
 
 LONG_TASKS = {"activity", "abyss", "buy_batch", "refresh_secret_paid", "refresh_star_source", "buy_shop_equipment"}
 SHOP_TASKS = {"refresh_secret", "refresh_star_source"}
-QUERIES = {"activity", "abyss"}
 MAX_SHOP_ROUNDS = 200
 STAR_SOURCE_QUOTE_UNAVAILABLE = "当前缺少可核实的星源商店刷新报价，本次未提交刷新。"
 SECRET_SHOP_QUOTE = Path(__file__).resolve().parents[1] / "assets" / "secret_shop_diamond_quote.json"
@@ -147,19 +146,55 @@ def shop_reference():
     ]]
 
 
-def query(state, kind):
-    from .activity_progress import cleared, records, scenes
+def free_abyss_challenge(definition):
+    from .game_data import enabled
+
+    return (enabled(definition.get("ServerBattle")) and not definition.get("EnterCost")
+            and definition.get("Energy") in (None, "", "0", 0))
+
+
+def is_query(code: str) -> bool:
+    from .bot_sweep_quotes import ACTIVITY_QUERY
+
+    return code in {"activity", "abyss"} or ACTIVITY_QUERY.fullmatch(code) is not None
+
+
+def query(state, kind, *, options=None):
+    from .activity_progress import ready_to_start, records, scenes
+    from .abyss_state import metadata
+    from .bot_sweep_quotes import activity_details
+    from .bot_views import stamina_count, stamina_detail
     from .tasks import abyss_scenes
 
+    if kind.partition(" ")[0] == "activity_sweep":
+        return activity_details(state, kind)
     if kind == "activity":
         saved = records(state)
-        families = list(dict.fromkeys(row["family"] for row in scenes(state)
-                                      if row["serverBattle"] and not row["cleared"]
-                                      and (not row["preScene"] or cleared(saved.get(row["preScene"])))))
+        next_stages = {}
+        for row in scenes(state):
+            if row["serverBattle"] and ready_to_start(row, saved):
+                next_stages.setdefault(row["family"], row)
+        candidates = [row for row in next_stages.values()
+                      if row["energyKnown"] and row["energy"] >= 0 and not row["extraEntryCost"]]
+        if options is not None:
+            options.extend(row["family"] for row in candidates[:10])
         teams = [str(row["ID"]) for row in state.get("Teams", {}).get("Settings", [])
                  if row.get("TeamSetting", {}).get("RolePosMap")]
-        return ["活动 ID " + ("、".join(families[:12]) or "暂无"), "队伍 ID " + ("、".join(teams[:12]) or "暂无")]
-    return [row["id"] for row in abyss_scenes(state)[:8]] or ["暂无可选关卡"]
+        return ["活动 ID " + ("、".join(row["family"] for row in candidates[:12]) or "暂无"),
+                "队伍 ID " + ("、".join(teams[:12]) or "暂无"),
+                stamina_detail(stamina_count(state)),
+                *[f"{row['activityName']} · 下一关 {row['id']} · 标价 {row['energy']} 体力"
+                  + (" · 剧情队伍填 0" if row["storyTeam"] else "") for row in candidates[:5]]]
+    definitions = metadata()["tables"]["Scene"]
+    candidates = [row for row in abyss_scenes(state) if free_abyss_challenge(definitions.get(row["id"]) or {})][:10]
+    stages = [row["id"] for row in candidates]
+    if options is not None:
+        options.extend(stages)
+    if not stages:
+        return ["暂无可选关卡"]
+    details = ["可挑战楼层 " + "、".join(stages[index:index + 5]) for index in range(0, len(stages), 5)]
+    cleared = "、".join(str(row["floor"]) for row in candidates if row.get("cleared")) or "暂无"
+    return [*details, f"快照已通关楼层 {cleared}", "挑战体力上限 0。"]
 
 
 def match_details(cards, position_key="index"):
@@ -460,6 +495,13 @@ def activity(client, args, cancel, progress):
     if result["ok"]:
         return ("ok" if completed else "skipped"), details
     reason = {
+        "activity_closed": "活动已结束。",
+        "prerequisite": "暂无满足前置条件的服务端战斗关卡。",
+        "energy_unknown": "下一关体力标价待核实。",
+        "energy_budget": "下一关会超出本次体力上限。",
+        "stamina_unknown": "账号体力未能同步。",
+        "stamina": "账号体力不足以进入下一关。",
+        "extra_cost": "下一关需要额外入场资源。",
         "scene_validation": "关卡配置未通过检查。",
         "team_validation": "关卡或队伍配置未通过检查。",
         "account_sync": "账号状态需要重新同步。",
@@ -471,13 +513,12 @@ def activity(client, args, cancel, progress):
 
 def abyss(client, args, cancel, progress):
     from .abyss_battle import run_abyss_battle
-    from .abyss_state import enabled, metadata
+    from .abyss_state import metadata
     from .tasks import normalize_abyss_config
 
     scene, waves = args
     definition = metadata()["tables"]["Scene"].get(scene) or {}
-    if (not enabled(definition.get("ServerBattle")) or definition.get("EnterCost")
-            or definition.get("Energy") not in (None, "", "0", 0)):
+    if not free_abyss_challenge(definition):
         return "skipped", ["此关卡的服务端战斗或入场消耗不符合本次授权"]
     try:
         params = normalize_abyss_config(client.account_state, scene, waves)
@@ -507,7 +548,7 @@ def run(account, task, args, cancel, progress, *, options=None):
         if cancel.is_set():
             return "cancelled", []
         if task == "long_info":
-            return "ok", query(account.client.account_state or {}, args)
+            return "ok", query(account.client.account_state or {}, args, options=options)
         if task == "refresh_secret":
             order, scheme, targets = args
             return refresh_shop(account.client, task, cancel, order, scheme, targets,

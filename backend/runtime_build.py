@@ -11,7 +11,7 @@ from .build_battle_metadata import build_battle_metadata
 from .guild_data_build import build_guild_aid, build_guild_quests, build_guild_store
 from .voting import build_catalog as build_voting_catalog
 
-BUILD_VERSION = 2
+BUILD_VERSION = 3
 
 SLOTS = {"Weapon": "weapon", "Head": "helmet", "Body": "armor", "Necklace": "necklace", "Ring": "ring", "Shoes": "boots"}
 SKILL_FIELDS = ("ID", "TargetTypeFun", "SkillType", "TargetType", "TargetCamp", "NoSelf",

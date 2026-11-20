@@ -9,6 +9,7 @@ import hashlib
 from collections import Counter
 import json
 from pathlib import Path
+import re
 
 try:
     from .game_table_dsl import DSLParser, DSLParseError
@@ -17,6 +18,7 @@ except ImportError:
 
 
 BATTLE_PATH = Path("assets/abyss_battle_static.json")
+SWEEP_SCENE = re.compile(r"(?:Hunt|Elf)(?:Fire|Earth|Ice|Dark|Light)_[0-9]+")
 STATS = ("HP", "Attack", "Defence", "Speed", "CriticalRate", "CriticalDamageRate",
          "EffectHitRate", "ResistanceRate", "PinchRate")
 TABLE_FIELDS = {
@@ -109,7 +111,14 @@ def build_battle_metadata(source: Path, provenance: dict) -> tuple[dict, dict]:
             raise ValueError(f"Battle source doesn't match extraction report: {name}")
         counts[name] = len(rows)
         index = {}
+        sweep_scenes = {}
         for number, raw in rows:
+            if name == "Scene" and SWEEP_SCENE.fullmatch(raw.get("ID", "")):
+                identifier = raw["ID"]
+                if identifier in sweep_scenes:
+                    raise ValueError(f"Duplicate battle ID: {name}:{identifier}")
+                sweep_scenes[identifier] = {key: raw[key] for key in ("Energy", "EnterCost") if key in raw}
+                continue
             row = dict(raw)
             dynamic = {key: parse(row.pop(key), name, number, key)
                        for key in list(row) if "DynamicField" in key}
@@ -153,7 +162,7 @@ def build_battle_metadata(source: Path, provenance: dict) -> tuple[dict, dict]:
                     raise ValueError(f"Duplicate battle ID: {name}:{identifier}")
                 row.pop("ID")
                 index[identifier] = row
-        tables[name] = index
+        tables[name] = {**index, **sweep_scenes} if name == "Scene" else index
     for rules in tables["AIAction"].values():
         rules.sort(key=lambda rule: -rule["Priority"])  # Stable for equal priority.
     missing = []

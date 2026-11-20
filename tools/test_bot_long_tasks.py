@@ -170,6 +170,59 @@ class AbyssTests(unittest.TestCase):
 
 
 class ActivityTests(unittest.TestCase):
+    def test_queries_offer_only_ready_activities_and_keep_sweep_reference_read_only(self):
+        def stage(sid, **overrides):
+            return {"id": sid, "family": sid.split("_")[0], "serverBattle": True,
+                    "stage": int(sid.rsplit("_", 1)[-1]), "cleared": False, "preScene": "", "energy": 8, "energyKnown": True,
+                    "extraEntryCost": False, "storyTeam": False, "activityName": "模拟活动", **overrides}
+
+        state = {"SceneDataContainer": {"Scenes": [{"StaticID": "BH1_1_1", "Stars": [1]}]}}
+        stages = [
+            stage("BH1_1_1", cleared=True, energy=17), stage("BH1_1_2", preScene="BH1_1_1"),
+            stage("BH2_1_1", extraEntryCost=True), stage("BH3_1_1", energyKnown=False),
+            stage("BH4_1_2", preScene="BH4_1_1"), stage("BH5_1_1", serverBattle=False),
+        ]
+        choices = []
+        with patch("backend.activity_progress.scenes", return_value=stages):
+            details = long.query(state, "activity", options=choices)
+            self.assertEqual(choices, ["BH1"])
+            self.assertIn("BH1_1_2", details[-1])
+            choices.clear()
+            reference = long.query(state, "activity_sweep BH1", options=choices)
+            self.assertEqual(choices, [])
+            self.assertIn("BH1_1_1", reference[-1])
+            self.assertIn("17 体力", reference[-1])
+            self.assertTrue(all("BH1_1_2" not in row for row in reference))
+
+    def test_abyss_options_only_include_supported_free_server_stages(self):
+        ids = ["MysteriousRealm_8", "MysteriousRealm_9", "MysteriousRealm_10"]
+        definitions = {sid: {"ServerBattle": "TRUE"} for sid in ids}
+        definitions[ids[1]]["Energy"] = "5"
+        rows = [{"id": sid, "floor": floor, "cleared": floor < 10} for floor, sid in enumerate(ids, start=8)]
+        with patch("backend.tasks.abyss_scenes", return_value=rows), patch(
+            "backend.abyss_state.metadata", return_value={"tables": {"Scene": definitions}},
+        ):
+            choices = []
+            details = long.query({}, "abyss", options=choices)
+        self.assertEqual(choices, [ids[0], ids[2]])
+        self.assertNotIn(ids[1], details[0])
+        self.assertEqual(details[1], "快照已通关楼层 8")
+
+    def test_activity_does_not_start_when_budget_or_balance_preflight_fails(self):
+        state = {"ItemContainer": {"Items": [{"StaticID": "3", "Count": 2}]}}
+        stage = {"id": "BH1_1_1", "serverBattle": True, "cleared": False,
+                 "preScene": "", "energy": 8, "energyKnown": True}
+        with patch("backend.activity_progress.scenes", return_value=[stage]), patch(
+            "backend.activity_progress.validate_scene", return_value={},
+        ), patch("backend.abyss_battle.run_activity_battle") as battle:
+            client = SimpleNamespace(account_state=state)
+            for budget, hint in ((7, "体力上限"), (8, "账号体力不足")):
+                with self.subTest(budget=budget):
+                    status, details = long.activity(client, ("BH1", "0", 1, budget), threading.Event(), Mock())
+                    self.assertEqual(status, "not_started")
+                    self.assertIn(hint, details[-1])
+            battle.assert_not_called()
+
     def test_second_stage_validation_failure_keeps_confirmed_stage_and_energy(self):
         from backend import activity_progress
 
