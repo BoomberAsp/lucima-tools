@@ -12,7 +12,8 @@ from .game_client import GameError, TaskDeferred
 from .runtime_data import pinned
 
 
-LONG_TASKS = {"activity", "abyss", "buy_batch", "refresh_secret_paid", "refresh_star_source", "buy_shop_equipment"}
+LONG_TASKS = {"activity", "abyss", "buy_batch", "refresh_secret_paid", "refresh_star_source", "buy_shop_equipment",
+              "sweep_hunt", "sweep_elf", "sweep_activity"}
 SHOP_TASKS = {"refresh_secret", "refresh_star_source"}
 MAX_SHOP_ROUNDS = 200
 STAR_SOURCE_QUOTE_UNAVAILABLE = "当前缺少可核实的星源商店刷新报价，本次未提交刷新。"
@@ -100,6 +101,10 @@ def parse_shop_request(task: str, code: str):
 
 
 def parse(task: str, code: str):
+    from .bot_sweep import TASKS as SWEEP_TASKS, parse_order
+
+    if task in SWEEP_TASKS:
+        return parse_order(task, code)
     parts = code.split()
     if task == "activity" and len(parts) == 4:
         family, team, count, energy = parts
@@ -167,7 +172,7 @@ def query(state, kind, *, options=None):
     from .tasks import abyss_scenes
 
     if kind.partition(" ")[0] == "activity_sweep":
-        return activity_details(state, kind)
+        return activity_details(state, kind, options=options)
     if kind == "activity":
         saved = records(state)
         next_stages = {}
@@ -559,5 +564,9 @@ def run(account, task, args, cancel, progress, *, options=None):
         if task in {"refresh_secret_paid", "refresh_star_source"}:
             refresh = refresh_secret_paid if task == "refresh_secret_paid" else refresh_star_source
             return refresh(account.client, args, cancel, progress, options=options)
+        if task in {"sweep_hunt", "sweep_elf", "sweep_activity"}:
+            from .bot_sweep import run_sweep
+
+            return run_sweep(account.client, args, cancel, progress)
         runner = {"activity": activity, "abyss": abyss, "buy_batch": buy}[task]
         return runner(account.client, args, cancel, progress)

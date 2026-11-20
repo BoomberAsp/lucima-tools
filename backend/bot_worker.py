@@ -30,7 +30,7 @@ PHASE_TWO = {"guild", "guild_weekly", "donate", "recruit", "stages", "equipment"
 DONATION_CAPS = {"gold": 5000, "courage": 1}
 
 
-def phase_two(account, task: str, arg: str) -> tuple[str, list[str]]:
+def phase_two(account, task: str, arg: str, *, options=None) -> tuple[str, list[str]]:
     """Return only bounded, selected receipt fields from the authenticated snapshot."""
     from .bot_sweep_quotes import stage_details
     from .guild import GUILD_DONATIONS, GuildService, has_guild
@@ -44,7 +44,7 @@ def phase_two(account, task: str, arg: str) -> tuple[str, list[str]]:
     with account.lock, account._request_scope():
         account.require_current_day()
         if task == "stages":
-            return "ok", stage_details(client, state, arg)
+            return "ok", stage_details(client, state, arg, options=options)
         if task == "equipment":
             query = arg.casefold()
             matches = []
@@ -260,13 +260,20 @@ def dispatch(request: dict, *, cancel=None, progress=None) -> dict:
                 if status == "shop_hit" and options:
                     result["shopOptions"] = options
                 elif task == "long_info" and status == "ok" and options:
-                    result["battleOptions"] = options
+                    if code.partition(" ")[0] == "activity_sweep":
+                        result["sweepOptions"] = ["activity", options]
+                    else:
+                        result["battleOptions"] = options
                 return result
             if task in PHASE_TWO:
-                status, details = phase_two(account, task, code)
+                options = [] if task == "stages" else None
+                status, details = phase_two(account, task, code, options=options)
                 if account.client.connection_status().get("reason") == "duplicate_login":
                     status = "duplicate_login"
-                return {"status": status, "auth": auth, "details": details}
+                result = {"status": status, "auth": auth, "details": details}
+                if task == "stages" and status == "ok" and options:
+                    result["sweepOptions"] = [code.partition(" ")[0], options]
+                return result
             toggles = TASKS[task]
             if task != "mail" and any(toggle not in accounts.LOGIN_TASK_IDS for toggle in toggles):
                 with account.lock:

@@ -2939,10 +2939,12 @@ def _finish_scene(c: GameClient, scene_id: str, team_id: str,
                      if urgent_container is not None else {})
 
     drop = _format_scene_drop(res)
+    # costItems/dropItems 供 QQ 扫荡逐轮核对实际扣费与聚合掉落；桌面端忽略多余键。
+    settlement = {"costItems": res.get("CostItems"), "dropItems": (res.get("Drop") or {}).get("Items") or []}
     if not drop:
         return {"ok": False, "detail": "未检测到掉落（可能是网络问题/体力不足/背包已满），已停止",
-                **urgent_result}
-    return {"ok": True, **drop, "raw": None, **urgent_result}
+                **settlement, **urgent_result}
+    return {"ok": True, **drop, "raw": None, **settlement, **urgent_result}
 
 
 @resources.pinned
